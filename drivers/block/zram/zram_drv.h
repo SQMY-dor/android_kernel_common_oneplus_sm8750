@@ -62,6 +62,7 @@ enum zram_pageflags {
 	ZRAM_PAGE_ANON,		/* 匿名页 */
 	ZRAM_PAGE_FILE,		/* 文件页 */
 	ZRAM_PAGE_DIRTY,	/* 脏页 */
+	ZRAM_STATE_MIGRATING,	/* page is being migrated on backing device */
 
 	__NR_ZRAM_PAGEFLAGS,
 };
@@ -78,10 +79,17 @@ struct zram_table_entry {
 #ifdef	CONFIG_ZRAM_WRITEBACK
 	struct list_head lru;
 	bool referenced;
+	u8 wb_nr_pages;
+	u8 migration_count;
+	u16 memcg_id;
 #endif
 };
 
 #ifdef CONFIG_ZRAM_WRITEBACK
+#define ZRAM_WB_CLUSTER_SHIFT	6
+#define ZRAM_WB_CLUSTER_SIZE	(1UL << ZRAM_WB_CLUSTER_SHIFT)
+#define ZRAM_WB_CLUSTER_MASK	(ZRAM_WB_CLUSTER_SIZE - 1)
+
 #define BATCH_SIZE 64
 #define WINDOW_RADIUS 8
 #define MIN_AGGREGATE 4
@@ -157,12 +165,20 @@ struct zram {
 	struct block_device *bdev;
 	unsigned long *bitmap;
 	unsigned long nr_pages;
+	spinlock_t bitmap_lock;
 	struct shrinker *zram_shrinker;
 	/* Global LRU list for zram entries. */
 	struct list_lru zram_list_lru;
 	struct work_struct shrink_work;
 	struct zram_pp_ctl *shrink_ctl;
 	atomic_t shrinker_writeback_in_progress;
+	bool stop_writeback;
+	u64 last_monitored_bd_reads;
+	u64 last_monitored_bd_writes;
+	unsigned long reclaim_threshold;
+	struct work_struct gc_work;
+	atomic_t gc_pending;
+	unsigned int gc_target_pages;
 #endif
 #ifdef CONFIG_ZRAM_MEMORY_TRACKING
 	struct dentry *debugfs_dir;
@@ -182,6 +198,17 @@ void zram_set_handle(struct zram *zram, u32 index, unsigned long handle);
 bool zram_test_flag(struct zram *zram, u32 index, enum zram_pageflags flag);
 void zram_set_flag(struct zram *zram, u32 index, enum zram_pageflags flag);
 void zram_free_page(struct zram *zram, size_t index);
+
+#ifdef CONFIG_ZRAM_WRITEBACK
+unsigned long zram_get_wb_blk_idx(struct zram *zram, u32 index);
+unsigned long zram_get_wb_cluster_base(struct zram *zram, u32 index);
+u32 zram_get_wb_cluster_off(struct zram *zram, u32 index);
+void zram_set_wb_handle(struct zram *zram, u32 index,
+			unsigned long cluster_base, u32 cluster_off,
+			u8 nr_pages);
+int zram_read_wb_page_sync(struct zram *zram, struct page *page,
+			   unsigned long entry);
+#endif
 
 #if defined CONFIG_ZRAM_WRITEBACK || defined CONFIG_ZRAM_MULTI_COMP
 struct zram_pp_slot {

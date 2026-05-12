@@ -14,6 +14,7 @@ struct zram_wb_sub_req {
 	struct zram_pp_slot *pps;
 	unsigned long blk_idx;  /* 物理块索引 */
 	unsigned long index;    /* ZRAM 逻辑索引 (table index) */
+	u8 cluster_off;
 };
 
 /* 
@@ -28,6 +29,7 @@ struct zram_wb_batch_request {
 	
 	/* 当前批次中包含的有效子请求数量 */
 	unsigned int count;
+	unsigned long start_blk_idx;
 	
 	/* 记录每个页面的元数据，用于回调时释放资源 */
 	struct zram_wb_sub_req sub_reqs[ZRAM_WB_MAX_BATCH_SIZE];
@@ -44,6 +46,10 @@ unsigned long alloc_block_bdev(struct zram *zram);
 unsigned long alloc_block_bdev_batch(struct zram *zram, int req_count, int *act_count);
 void free_block_bdev(struct zram *zram, unsigned long blk_idx);
 void free_block_bdev_range(struct zram *zram, unsigned long blk_idx, int count);
+int zram_gc_compact(struct zram *zram, int target_pages);
+void zram_schedule_gc(struct zram *zram, int target_pages);
+void zram_cancel_gc(struct zram *zram);
+void zram_init_gc(struct zram *zram);
 
 struct zram_wb_batch_request *alloc_wb_batch_request(struct zram *zram,
 						     struct zram_pp_ctl *ctl,
@@ -61,4 +67,3 @@ inline void destroy_zram_writeback(void) {}
 #endif
 
 #endif /* _ZRAM_WRITEBACK_H_ */
-
