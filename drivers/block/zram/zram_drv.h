@@ -16,6 +16,7 @@
 #define _ZRAM_DRV_H_
 
 #include <linux/rwsem.h>
+#include <linux/workqueue.h>
 #include <linux/zsmalloc.h>
 #include <linux/crypto.h>
 #include <linux/list_lru.h>
@@ -159,6 +160,9 @@ struct zram {
 	struct shrinker *zram_shrinker;
 	/* Global LRU list for zram entries. */
 	struct list_lru zram_list_lru;
+	struct work_struct shrink_work;
+	struct zram_pp_ctl *shrink_ctl;
+	atomic_t shrinker_writeback_in_progress;
 #endif
 #ifdef CONFIG_ZRAM_MEMORY_TRACKING
 	struct dentry *debugfs_dir;

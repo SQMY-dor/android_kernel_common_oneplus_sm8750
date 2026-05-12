@@ -605,6 +605,14 @@ static ssize_t writeback_limit_show(struct device *dev,
 static void reset_bdev(struct zram *zram)
 {
 	struct block_device *bdev;
+	struct zram_pp_ctl *ctl;
+
+	cancel_work_sync(&zram->shrink_work);
+	ctl = xchg(&zram->shrink_ctl, NULL);
+	if (ctl) {
+		atomic_set(&zram->shrinker_writeback_in_progress, 0);
+		release_pp_ctl(zram, ctl);
+	}
 
 	if (!zram->backing_dev)
 		return;
@@ -1138,6 +1146,34 @@ struct zram_work {
 	struct page *page;
 	int error;
 };
+
+static void zram_shrinker_writeback_work(struct work_struct *work)
+{
+	struct zram *zram = container_of(work, struct zram, shrink_work);
+	struct zram_pp_ctl *ctl;
+
+	ctl = xchg(&zram->shrink_ctl, NULL);
+	if (!ctl)
+		goto out;
+
+	if (!down_read_trylock(&zram->init_lock))
+		goto out_release;
+
+	if (!init_done(zram) || !zram->backing_dev)
+		goto out_unlock;
+
+	if (!atomic_xchg(&zram->pp_in_progress, 1)) {
+		zram_writeback_slots(zram, ctl);
+		atomic_set(&zram->pp_in_progress, 0);
+	}
+
+out_unlock:
+	up_read(&zram->init_lock);
+out_release:
+	release_pp_ctl(zram, ctl);
+out:
+	atomic_set(&zram->shrinker_writeback_in_progress, 0);
+}
 
 static void zram_sync_read(struct work_struct *work)
 {
@@ -2982,6 +3018,9 @@ static int zram_add(void)
 	init_rwsem(&zram->init_lock);
 #ifdef CONFIG_ZRAM_WRITEBACK
 	spin_lock_init(&zram->wb_limit_lock);
+	INIT_WORK(&zram->shrink_work, zram_shrinker_writeback_work);
+	zram->shrink_ctl = NULL;
+	atomic_set(&zram->shrinker_writeback_in_progress, 0);
 #endif
 
 	/* gendisk structure */
@@ -3395,7 +3434,7 @@ static enum lru_status zram_seed_collect_cb(struct list_head *item, struct list_
     unsigned long flags;
 
     if (work->nr_candidates >= BATCH_SIZE)
-        return LRU_STOP;
+        return LRU_SKIP;
 
     /* 1. 活跃度检查 - 给活跃页面第二次机会 */
     if (entry->referenced) {
@@ -3446,16 +3485,14 @@ static bool try_claim_slot(struct zram *zram, unsigned long index)
             /* 1. 干净的文件页：直接释放 */
             zram_free_page(zram, index);
             zram_slot_unlock(zram, index);
-            ret = LRU_REMOVED_RETRY; /* 让 walker 继续尝试下个元素 */
-            goto relock;
+            return false;
         } else {
             /* 2. 脏文件页：踢出 LRU 并且清除 idle，不触发回写 */
             if (zram_test_flag(zram, index, ZRAM_IDLE))
-                zram_lru_del(zram, entry); /* 本身携带安全锁操作 */
+                zram_lru_del(zram, &zram->table[index]);
             zram_clear_flag(zram, index, ZRAM_IDLE);
             zram_slot_unlock(zram, index);
-            ret = LRU_REMOVED_RETRY;
-            goto relock;
+            return false;
         }
     }
     /* 3. 匿名页或者未识别的页，将穿透该 if 逻辑走正常的回写通道 */
@@ -3520,8 +3557,10 @@ static unsigned long zram_shrinker_scan(struct shrinker *shrinker, struct shrink
     unsigned long last_window_end = 0;
 
     /* 基本检查 */
-    if (!zram->backing_dev || !gfp_has_io_fs(sc->gfp_mask))
-        return SHRINK_STOP;
+    if (!zram->backing_dev || !gfp_has_io_fs(sc->gfp_mask) ||
+	    atomic_read(&zram->shrinker_writeback_in_progress) ||
+	    atomic_read(&zram->pp_in_progress))
+		return SHRINK_STOP;
 
     /* 
      * Phase 1: 分配工作上下文
@@ -3600,9 +3639,15 @@ static unsigned long zram_shrinker_scan(struct shrinker *shrinker, struct shrink
         }
     }
 
-    /* Phase 5: 提交 I/O */
+    /* Phase 5: 异步提交 I/O，避免 shrinker 在 writeback 路径阻塞 */
     if (pages_scheduled > 0) {
-        zram_writeback_slots(zram, work->ctl);
+		if (!atomic_xchg(&zram->shrinker_writeback_in_progress, 1)) {
+			zram->shrink_ctl = work->ctl;
+			queue_work(system_unbound_wq, &zram->shrink_work);
+			work->ctl = NULL;
+		} else {
+			pages_scheduled = 0;
+		}
     }
 
 out:
@@ -3622,6 +3667,10 @@ static unsigned long zram_shrinker_count(struct shrinker *shrinker, struct shrin
         goto out;
     }
 
+	if (atomic_read(&zram->shrinker_writeback_in_progress) ||
+	    atomic_read(&zram->pp_in_progress))
+		goto out;
+
     /* 
      * 检查统计数据和 LRU 节点是否存在
      */
@@ -3634,6 +3683,8 @@ static unsigned long zram_shrinker_count(struct shrinker *shrinker, struct shrin
     }
 
     ret = list_lru_shrink_count(&zram->zram_list_lru, sc);
+	if (ret)
+		ret = max(ret >> 3, 1UL);
 
 out:
     rcu_read_unlock();
