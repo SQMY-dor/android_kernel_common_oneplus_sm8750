@@ -38,6 +38,8 @@
 #include <linux/mm.h>
 #include <linux/memcontrol.h>
 #include <linux/kthread.h>
+#include <linux/psi.h>
+#include <linux/sched/loadavg.h>
 #include <linux/sysms_finder.h>
 #include <linux/suspend.h>
 
@@ -56,6 +58,7 @@
 
 #define CHECK_INTERVAL (30 * HZ) // 每30秒检查一次
 #define MEM_THRESHOLD 80
+#define IO_PSI_STOP_WRITEBACK_THRESHOLD 10
 
 static void zram_clear_flag(struct zram *zram, u32 index,
 			enum zram_pageflags flag);
@@ -3891,6 +3894,24 @@ static int get_memory_usage(void)
     return ((total - free) * 100) / total;
 }
 
+static unsigned int get_io_psi_avg10(void)
+{
+#ifdef CONFIG_PSI
+	unsigned long io_avg10;
+
+	if (static_branch_likely(&psi_disabled))
+		return 0;
+
+	mutex_lock(&psi_system.avgs_lock);
+	io_avg10 = psi_system.avg[PSI_IO_SOME][0];
+	mutex_unlock(&psi_system.avgs_lock);
+
+	return min_t(unsigned int, LOAD_INT(io_avg10), 100U);
+#else
+	return 0;
+#endif
+}
+
 // 监控线程函数
 static int monitor_func(void *data)
 {
@@ -3905,6 +3926,7 @@ static int monitor_func(void *data)
 
     while (!kthread_should_stop()) {
 		int mem_usage = get_memory_usage();
+		unsigned int io_psi = get_io_psi_avg10();
 		total_zram_usage = 0;
 		zram_count = 0;
 		if (IS_ENABLED(CONFIG_ZRAM_TRACK_ENTRY_ACTIME))
@@ -3955,8 +3977,8 @@ static int monitor_func(void *data)
 					zram->wb->shadow_cache_limit = ZRAM_WB_CLUSTER_SIZE * PAGE_SIZE * 8;
 					zram->wb->idle_skip_interval = 30;
 				}
-				if (mem_usage >= MEM_THRESHOLD &&
-				    delta_reads > max_t(u64, delta_writes * 4, 128ULL))
+				if (io_psi >= IO_PSI_STOP_WRITEBACK_THRESHOLD &&
+					delta_reads > max_t(u64, delta_writes * 4, 128ULL))
 					stop_writeback = true;
 			}
 			WRITE_ONCE(zram->wb->stop_writeback, stop_writeback);
@@ -3984,12 +4006,13 @@ static int monitor_func(void *data)
 							      50ULL,
 							      200ULL);
 			batch_size = div64_ul(768 * combined_pressure_factor_percent, 100ULL);
-			pr_info("combined_pressure_factor_percent=%llu, batch_size=%llu\n", combined_pressure_factor_percent, batch_size);
+			pr_info("combined_pressure_factor_percent=%llu, batch_size=%llu, io_psi=%u%%\n",
+				combined_pressure_factor_percent, batch_size, io_psi);
 			exec_count = 0;
 		}
 		
-		pr_info("zram_count=%d, avg_zram_usage=%lu%%, mem_usage=%d%%\n",
-			zram_count, avg_zram_usage, mem_usage);
+		pr_info("zram_count=%d, avg_zram_usage=%lu%%, mem_usage=%d%%, io_psi=%u%%\n",
+			zram_count, avg_zram_usage, mem_usage, io_psi);
 
         schedule_timeout_interruptible(CHECK_INTERVAL);
     }
