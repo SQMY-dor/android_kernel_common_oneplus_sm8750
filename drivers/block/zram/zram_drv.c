@@ -4340,6 +4340,10 @@ static int __init zram_init(void)
 	if (setup_zram_writeback())
 		goto out_error;
 
+	ret = zram_memcg_init();
+	if (ret)
+		goto out_destroy_writeback;
+
 #ifdef CONFIG_ZRAM_WRITEBACK
 	monitor_thread = kthread_run(monitor_func, NULL, "zram_monitor");
 #endif
@@ -4355,6 +4359,8 @@ static int __init zram_init(void)
 
 	return 0;
 
+out_destroy_writeback:
+	destroy_zram_writeback();
 out_error:
 	destroy_devices();
 	return ret;
@@ -4373,6 +4379,7 @@ static void __exit zram_exit(void)
 	unregister_sysctl_table(zram_sysctl_table_header);
 #endif //CONFIG_ZRAM_MULTI_COMP
 
+	zram_memcg_exit();
 	destroy_zram_writeback();
 	destroy_devices();
 }
