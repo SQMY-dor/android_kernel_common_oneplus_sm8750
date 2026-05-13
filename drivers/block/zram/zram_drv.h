@@ -16,6 +16,9 @@
 #define _ZRAM_DRV_H_
 
 #include <linux/rwsem.h>
+#include <linux/spinlock.h>
+#include <linux/timer.h>
+#include <linux/percpu_counter.h>
 #include <linux/workqueue.h>
 #include <linux/zsmalloc.h>
 #include <linux/crypto.h>
@@ -62,6 +65,7 @@ enum zram_pageflags {
 	ZRAM_PAGE_ANON,		/* 匿名页 */
 	ZRAM_PAGE_FILE,		/* 文件页 */
 	ZRAM_PAGE_DIRTY,	/* 脏页 */
+	ZRAM_REFERENCED,	/* shrinker second-chance hint */
 	ZRAM_STATE_MIGRATING,	/* page is being migrated on backing device */
 
 	__NR_ZRAM_PAGEFLAGS,
@@ -78,7 +82,6 @@ struct zram_table_entry {
 #endif
 #ifdef	CONFIG_ZRAM_WRITEBACK
 	struct list_head lru;
-	bool referenced;
 	u8 wb_nr_pages;
 	u8 migration_count;
 	u16 memcg_id;
@@ -93,35 +96,110 @@ struct zram_table_entry {
 #define BATCH_SIZE 64
 #define WINDOW_RADIUS 8
 #define MIN_AGGREGATE 4
+#define ZRAM_SHADOW_CACHE_TTL	(2 * HZ)
+#define ZRAM_SHADOW_CACHE_TTL_MIN	(HZ / 2)
+#define ZRAM_SHADOW_CACHE_TTL_MAX	(10 * HZ)
+#define ZRAM_SHADOW_CACHE_TTL_GROW_STEP	(HZ / 2)
+#define ZRAM_SHADOW_CACHE_TTL_SHRINK_STEP	(HZ)
+#define ZRAM_SHADOW_HIT_WINDOW	64
+#define ZRAM_GC_PERIODIC_INTERVAL	(15 * HZ)
+#define ZRAM_GC_PERIODIC_PAGES	16
+#define ZRAM_GC_MAX_SCAN_CLUSTERS	128
 
-struct zram_shrink_work {
-    struct zram *zram;
-    unsigned long candidates[BATCH_SIZE]; /* 候选页面索引数组 */
-    int nr_candidates;                    /* 当前收集数量 */
-    struct zram_pp_ctl *ctl;              /* 写回控制器 */
+enum zram_shadow_cache_state {
+	ZRAM_SHADOW_CLEAN = 0,
+	ZRAM_SHADOW_HIT,
+};
+
+enum zram_wb_cluster_state {
+	ZRAM_WB_CLUSTER_CLEAN = 0,
+	ZRAM_WB_CLUSTER_DIRTY_FREE,
+};
+
+struct zram_shadow_cache {
+	struct list_head node;
+	struct timer_list timer;
+	struct zram *zram;
+	struct page **pages;
+	u32 *indexes;
+	unsigned long cluster_base;
+	unsigned long expires_at;
+	unsigned long ttl_jiffies;
+	unsigned long state_bitmap;
+	u32 nr_pages;
+	u32 age_seq;
+	u32 bytes;
 };
 #endif
 
 struct zram_stats {
-	atomic64_t compr_data_size;	/* compressed size of pages stored */
-	atomic64_t failed_reads;	/* can happen when memory is too low */
-	atomic64_t failed_writes;	/* can happen when memory is too low */
-	atomic64_t notify_free;	/* no. of swap slot free notifications */
-	atomic64_t same_pages;		/* no. of same element filled pages */
-	atomic64_t huge_pages;		/* no. of huge pages */
-	atomic64_t huge_pages_since;	/* no. of huge pages since zram set up */
-	atomic64_t pages_stored;	/* no. of pages currently stored */
-	atomic_long_t max_used_pages;	/* no. of maximum pages stored */
-	atomic64_t writestall;		/* no. of write slow paths */
-	atomic64_t miss_free;		/* no. of missed free */
-#ifdef	CONFIG_ZRAM_WRITEBACK
-	atomic64_t bd_count;		/* no. of pages in backing device */
-	atomic64_t bd_reads;		/* no. of reads from backing device */
-	atomic64_t bd_writes;		/* no. of writes from backing device */
+	/* hot percpu */
+	struct percpu_counter compr_data_size;
+	struct percpu_counter same_pages;
+	struct percpu_counter huge_pages;
+	struct percpu_counter pages_stored;
+#ifdef CONFIG_ZRAM_WRITEBACK
+	struct percpu_counter bd_count;
+	struct percpu_counter bd_reads;
+	struct percpu_counter bd_writes;
+#endif
+
+	/* atomics */
+	atomic_long_t max_used_pages;
+	atomic64_t failed_reads;
+	atomic64_t failed_writes;
+	atomic64_t notify_free;
+	atomic64_t huge_pages_since;
+	atomic64_t writestall;
+	atomic64_t miss_free;
+#ifdef CONFIG_ZRAM_WRITEBACK
 	atomic64_t written_back_pages;
 	atomic64_t reject_reclaim_fail;
+	atomic64_t prefetch_total;
+	atomic64_t prefetch_hits;
 #endif
 };
+
+#ifdef CONFIG_ZRAM_WRITEBACK
+struct zram_wb_state {
+	struct zram *owner;
+	struct file *backing_dev;
+	struct block_device *bdev;
+	unsigned long *bitmap;
+	unsigned long *dirty_free_bitmap;
+	unsigned long nr_pages;
+	unsigned long reclaim_threshold;
+	unsigned long shadow_ttl_jiffies;
+	unsigned long shadow_last_hit_rate;
+	unsigned long gc_scan_cursor;
+	unsigned long idle_skip_interval;
+	u64 bd_wb_limit;
+	u64 last_monitored_bd_reads;
+	u64 last_monitored_bd_writes;
+	struct shrinker *zram_shrinker;
+	struct list_lru zram_list_lru;
+	struct work_struct shrink_work;
+	struct zram_pp_ctl *shrink_ctl;
+	struct work_struct gc_work;
+	struct delayed_work gc_periodic_work;
+	struct list_head shadow_caches;
+	spinlock_t wb_limit_lock;
+	spinlock_t bitmap_lock;
+	spinlock_t shadow_lock;
+	atomic_t shrinker_writeback_in_progress;
+	atomic_t gc_pending;
+	u32 gc_target_pages;
+	u32 shadow_cache_bytes;
+	u32 shadow_cache_limit;
+	u32 shadow_cache_next_age;
+	u32 shadow_hits_window;
+	u32 shadow_access_window;
+	bool wb_limit_enable;
+	bool stop_writeback;
+	bool prefetch_disabled;
+	bool emergency_reclaim;
+};
+#endif
 
 #ifdef CONFIG_ZRAM_MULTI_COMP
 #define ZRAM_PRIMARY_COMP	0U
@@ -152,43 +230,23 @@ struct zram {
 	 */
 	u64 disksize;	/* bytes */
 	const char *comp_algs[ZRAM_MAX_COMPS];
+#ifdef CONFIG_ZRAM_WRITEBACK
+	struct zram_wb_state *wb;
+#endif
+#ifdef CONFIG_ZRAM_MEMORY_TRACKING
+	struct dentry *debugfs_dir;
+#endif
 	s8 num_active_comps;
 	/*
 	 * zram is claimed so open request will be failed
 	 */
 	bool claim; /* Protected by disk->open_mutex */
-#ifdef CONFIG_ZRAM_WRITEBACK
-	struct file *backing_dev;
-	spinlock_t wb_limit_lock;
-	bool wb_limit_enable;
-	u64 bd_wb_limit;
-	struct block_device *bdev;
-	unsigned long *bitmap;
-	unsigned long nr_pages;
-	spinlock_t bitmap_lock;
-	struct shrinker *zram_shrinker;
-	/* Global LRU list for zram entries. */
-	struct list_lru zram_list_lru;
-	struct work_struct shrink_work;
-	struct zram_pp_ctl *shrink_ctl;
-	atomic_t shrinker_writeback_in_progress;
-	bool stop_writeback;
-	u64 last_monitored_bd_reads;
-	u64 last_monitored_bd_writes;
-	unsigned long reclaim_threshold;
-	struct work_struct gc_work;
-	atomic_t gc_pending;
-	unsigned int gc_target_pages;
-#endif
-#ifdef CONFIG_ZRAM_MEMORY_TRACKING
-	struct dentry *debugfs_dir;
-#endif
 	atomic_t pp_in_progress;
 #ifdef CONFIG_ZRAM_AUTO_SIZE
 	unsigned int historical_mem_pressure;
 	unsigned int historical_zram_pressure;
-	u64 historical_disksize;
 	spinlock_t pressure_lock; 
+	u64 historical_disksize;
 #endif
 };
 

@@ -22,8 +22,10 @@ static bool zram_wb_allowed(struct zram *zram);
 
 static void zram_gc_workfn(struct work_struct *work)
 {
-	struct zram *zram = container_of(work, struct zram, gc_work);
-	unsigned int target_pages = READ_ONCE(zram->gc_target_pages);
+	struct zram_wb_state *wb = container_of(work, struct zram_wb_state,
+					       gc_work);
+	struct zram *zram = wb->owner;
+	unsigned int target_pages = READ_ONCE(zram->wb->gc_target_pages);
 
 	if (target_pages > ZRAM_WB_MAX_BATCH_SIZE)
 		target_pages = ZRAM_WB_MAX_BATCH_SIZE;
@@ -31,31 +33,36 @@ static void zram_gc_workfn(struct work_struct *work)
 		target_pages = 2;
 
 	if (down_read_trylock(&zram->init_lock)) {
-		if (zram->disksize && zram->backing_dev && zram_wb_allowed(zram))
+		if (zram->disksize && zram->wb->backing_dev && zram_wb_allowed(zram))
 			zram_gc_compact(zram, target_pages);
 		up_read(&zram->init_lock);
 	}
 
-	atomic_set(&zram->gc_pending, 0);
+	atomic_set(&zram->wb->gc_pending, 0);
 }
 
-struct zram_wb_frag_score {
-	unsigned long cluster_base;
-	unsigned int used;
-	unsigned int holes;
-	unsigned int max_run;
-	unsigned int transitions;
-	unsigned int score;
-};
+static void zram_gc_periodic_workfn(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct zram_wb_state *wb = container_of(dwork, struct zram_wb_state,
+					       gc_periodic_work);
+	struct zram *zram = wb->owner;
 
-struct zram_wb_memcg_group {
-	u16 memcg_id;
-	unsigned int count;
-};
+	if (down_read_trylock(&zram->init_lock)) {
+		if (zram->disksize && zram->wb->backing_dev && zram_wb_allowed(zram) &&
+		    !READ_ONCE(zram->wb->prefetch_disabled) &&
+		    !READ_ONCE(zram->wb->emergency_reclaim))
+			zram_gc_compact(zram, ZRAM_GC_PERIODIC_PAGES);
+		up_read(&zram->init_lock);
+	}
+
+	queue_delayed_work(system_unbound_wq, &zram->wb->gc_periodic_work,
+				 ZRAM_GC_PERIODIC_INTERVAL);
+}
 
 static bool zram_wb_allowed(struct zram *zram)
 {
-	return !READ_ONCE(zram->stop_writeback);
+	return !READ_ONCE(zram->wb->stop_writeback);
 }
 
 static void zram_wb_clear_flag(struct zram *zram, u32 index,
@@ -75,13 +82,13 @@ static unsigned long zram_wb_cluster_max_free_run(struct zram *zram,
 		unsigned long cluster_base)
 {
 	unsigned long cluster_end = min(cluster_base + ZRAM_WB_CLUSTER_SIZE,
-					 zram->nr_pages);
+					 zram->wb->nr_pages);
 	unsigned long max_free_run = 0;
 	unsigned long current_free_run = 0;
 	unsigned long blk;
 
 	for (blk = cluster_base; blk < cluster_end; blk++) {
-		if (test_bit(blk, zram->bitmap)) {
+		if (test_bit(blk, zram->wb->bitmap)) {
 			max_free_run = max(max_free_run, current_free_run);
 			current_free_run = 0;
 		} else {
@@ -100,12 +107,12 @@ static void zram_replace_block_bdev(struct zram *zram,
 	if (old_blk_idx == new_blk_idx)
 		return;
 
-	spin_lock_irqsave(&zram->bitmap_lock, flags);
-	if (WARN_ON_ONCE(!test_bit(new_blk_idx, zram->bitmap)))
-		set_bit(new_blk_idx, zram->bitmap);
-	if (!test_and_clear_bit(old_blk_idx, zram->bitmap))
+	spin_lock_irqsave(&zram->wb->bitmap_lock, flags);
+	if (WARN_ON_ONCE(!test_bit(new_blk_idx, zram->wb->bitmap)))
+		set_bit(new_blk_idx, zram->wb->bitmap);
+	if (!test_and_clear_bit(old_blk_idx, zram->wb->bitmap))
 		WARN_ON_ONCE(1);
-	spin_unlock_irqrestore(&zram->bitmap_lock, flags);
+	spin_unlock_irqrestore(&zram->wb->bitmap_lock, flags);
 }
 
 static bool zram_wb_slot_can_gc(struct zram *zram, u32 index)
@@ -123,7 +130,7 @@ static u16 zram_wb_preferred_memcg(struct zram *zram,
 {
 	struct zram_wb_memcg_group groups[ZRAM_WB_CLUSTER_SIZE];
 	unsigned long cluster_end = min(cluster_base + ZRAM_WB_CLUSTER_SIZE,
-					 zram->nr_pages);
+					 zram->wb->nr_pages);
 	u16 best_id = 0;
 	unsigned int best_count = 0;
 	int nr_groups = 0;
@@ -245,18 +252,20 @@ static unsigned int zram_wb_cluster_score(struct zram *zram,
 		struct zram_wb_frag_score *frag)
 {
 	unsigned long cluster_end = min(cluster_base + ZRAM_WB_CLUSTER_SIZE,
-					 zram->nr_pages);
+					 zram->wb->nr_pages);
 	unsigned int used = 0;
+	unsigned int dominant_memcg = 0;
 	unsigned int holes = 0;
 	unsigned int max_run = 0;
 	unsigned int transitions = 0;
 	unsigned int current_run = 0;
+	unsigned int memcg_bonus = 0;
 	bool prev_set = false;
 	bool seen_prev = false;
 	unsigned long blk;
 
 	for (blk = cluster_base; blk < cluster_end; blk++) {
-		bool set = test_bit(blk, zram->bitmap);
+		bool set = test_bit(blk, zram->wb->bitmap);
 
 		if (set) {
 			used++;
@@ -277,12 +286,35 @@ static unsigned int zram_wb_cluster_score(struct zram *zram,
 	if (used < 2 || used >= (cluster_end - cluster_base) || max_run == used)
 		return 0;
 
+	dominant_memcg = 0;
+	if (used)
+		dominant_memcg = zram_wb_preferred_memcg(zram, cluster_base);
+	if (dominant_memcg) {
+		unsigned long idx;
+
+		for (idx = cluster_base; idx < cluster_end; idx++) {
+			u16 memcg_id;
+
+			zram_slot_lock(zram, idx);
+			if (!zram_wb_slot_can_gc(zram, idx)) {
+				zram_slot_unlock(zram, idx);
+				continue;
+			}
+			memcg_id = zram->table[idx].memcg_id;
+			zram_slot_unlock(zram, idx);
+			if (memcg_id == dominant_memcg)
+				memcg_bonus++;
+		}
+	}
+
 	frag->cluster_base = cluster_base;
 	frag->used = used;
 	frag->holes = holes;
 	frag->max_run = max_run;
 	frag->transitions = transitions;
-	frag->score = (used - max_run) * 4 + holes * 2 + transitions;
+	frag->score = (used - max_run) * 4 + holes * 2 + transitions +
+			  memcg_bonus * 2 + min_t(unsigned long,
+				  zram->wb->shadow_last_hit_rate / 10, 10UL);
 
 	return frag->score;
 }
@@ -295,7 +327,7 @@ static bool zram_wb_find_best_cluster(struct zram *zram,
 
 	memset(best, 0, sizeof(*best));
 
-	for (cluster_base = 0; cluster_base < zram->nr_pages;
+	for (cluster_base = 0; cluster_base < zram->wb->nr_pages;
 	     cluster_base += ZRAM_WB_CLUSTER_SIZE) {
 		struct zram_wb_frag_score cur;
 
@@ -312,12 +344,25 @@ static bool zram_wb_find_best_cluster(struct zram *zram,
 	return found;
 }
 
+static int zram_wb_write_page(struct zram *zram, struct page *page,
+			      unsigned long blk_idx)
+{
+	struct bio_vec bv;
+	struct bio bio;
+
+	bio_init(&bio, zram->wb->bdev, &bv, 1, REQ_OP_WRITE);
+	bio.bi_iter.bi_sector = blk_idx * (PAGE_SIZE >> 9);
+	__bio_add_page(&bio, page, PAGE_SIZE, 0);
+
+	return submit_bio_wait(&bio);
+}
+
 int zram_gc_compact(struct zram *zram, int target_pages)
 {
 	unsigned long indexes[ZRAM_WB_MAX_BATCH_SIZE];
 	unsigned long old_blks[ZRAM_WB_MAX_BATCH_SIZE];
 	struct page *pages[ZRAM_WB_MAX_BATCH_SIZE];
-	struct zram_wb_memcg_group groups[ZRAM_WB_CLUSTER_SIZE];
+	struct zram_wb_memcg_group *groups;
 	struct zram_wb_frag_score best;
 	u16 preferred_memcg;
 	unsigned long new_base;
@@ -334,8 +379,12 @@ int zram_gc_compact(struct zram *zram, int target_pages)
 	for (i = 0; i < target_pages; i++)
 		pages[i] = NULL;
 
-	if (!zram_wb_find_best_cluster(zram, &best))
+	groups = kcalloc(ZRAM_WB_CLUSTER_SIZE, sizeof(*groups), GFP_KERNEL);
+	if (!groups)
 		return 0;
+
+	if (!zram_wb_find_best_cluster(zram, &best))
+		goto free_groups;
 	preferred_memcg = zram_wb_preferred_memcg(zram, best.cluster_base);
 
 	if (preferred_memcg)
@@ -343,7 +392,7 @@ int zram_gc_compact(struct zram *zram, int target_pages)
 						   indexes, old_blks,
 						   nr_selected, target_pages);
 
-	nr_groups = zram_wb_count_groups(zram, groups, ARRAY_SIZE(groups));
+	nr_groups = zram_wb_count_groups(zram, groups, ZRAM_WB_CLUSTER_SIZE);
 	while (nr_selected < target_pages) {
 		int remaining = target_pages - nr_selected;
 		u16 picked_memcg = 0;
@@ -399,15 +448,7 @@ int zram_gc_compact(struct zram *zram, int target_pages)
 	}
 
 	for (i = 0; i < nr_selected; i++) {
-		struct bio_vec bv;
-		struct bio bio;
-		int err;
-
-		bio_init(&bio, zram->bdev, &bv, 1, REQ_OP_WRITE);
-		bio.bi_iter.bi_sector = (new_base + i) * (PAGE_SIZE >> 9);
-		__bio_add_page(&bio, pages[i], PAGE_SIZE, 0);
-		err = submit_bio_wait(&bio);
-		if (err)
+		if (zram_wb_write_page(zram, pages[i], new_base + i))
 			goto free_new_range;
 	}
 
@@ -434,7 +475,7 @@ int zram_gc_compact(struct zram *zram, int target_pages)
 	}
 
 	if (zram_wb_cluster_max_free_run(zram, best.cluster_base) <
-	    zram->reclaim_threshold)
+	    zram->wb->reclaim_threshold)
 		force_reclaim = true;
 
 	for (i = 0; i < nr_selected; i++) {
@@ -444,6 +485,8 @@ int zram_gc_compact(struct zram *zram, int target_pages)
 
 	if (force_reclaim && zram_wb_allowed(zram))
 		zram_wb_find_best_cluster(zram, &best);
+
+	kfree(groups);
 
 	return nr_selected;
 
@@ -466,6 +509,9 @@ rollback:
 		zram_slot_unlock(zram, indexes[i]);
 	}
 
+free_groups:
+	kfree(groups);
+
 	return 0;
 }
 
@@ -479,36 +525,47 @@ void zram_schedule_gc(struct zram *zram, int target_pages)
 	if (target_pages < 2)
 		target_pages = 2;
 
-	WRITE_ONCE(zram->gc_target_pages, target_pages);
-	if (atomic_cmpxchg(&zram->gc_pending, 0, 1) == 0)
-		queue_work(system_unbound_wq, &zram->gc_work);
+	WRITE_ONCE(zram->wb->gc_target_pages, target_pages);
+	if (atomic_cmpxchg(&zram->wb->gc_pending, 0, 1) == 0)
+		queue_work(system_unbound_wq, &zram->wb->gc_work);
 }
 
 void zram_cancel_gc(struct zram *zram)
 {
-	cancel_work_sync(&zram->gc_work);
-	atomic_set(&zram->gc_pending, 0);
+	cancel_work_sync(&zram->wb->gc_work);
+	cancel_delayed_work_sync(&zram->wb->gc_periodic_work);
+	atomic_set(&zram->wb->gc_pending, 0);
 }
 
 void zram_init_gc(struct zram *zram)
 {
-	INIT_WORK(&zram->gc_work, zram_gc_workfn);
-	atomic_set(&zram->gc_pending, 0);
-	zram->gc_target_pages = ZRAM_WB_MAX_BATCH_SIZE;
+	INIT_WORK(&zram->wb->gc_work, zram_gc_workfn);
+	INIT_DELAYED_WORK(&zram->wb->gc_periodic_work, zram_gc_periodic_workfn);
+	atomic_set(&zram->wb->gc_pending, 0);
+	zram->wb->gc_target_pages = ZRAM_WB_MAX_BATCH_SIZE;
 }
 
 /* 
  * front_pad: 在 bio 结构之前预留空间存放 zram_wb_batch_request
  * 这个结构现在比较大 (包含数组)，必须确保 bio 对齐
  */
-#define ZRAM_WB_FRONT_PAD \
+#define ZRAM_WB_FRONT_PAD_WRITE \
 	roundup(sizeof(struct zram_wb_batch_request), __alignof__(struct bio))
+
+#define ZRAM_WB_FRONT_PAD_READ \
+	roundup(sizeof(struct zram_wb_read_request), __alignof__(struct bio))
+
+#define ZRAM_WB_FRONT_PAD \
+	max(ZRAM_WB_FRONT_PAD_WRITE, ZRAM_WB_FRONT_PAD_READ)
 
 /*
  * 从 bio 指针获取其前面的 zram_wb_batch_request 结构
  */
 #define bio_to_wb_batch(bio) \
 	((struct zram_wb_batch_request *)((char *)(bio) - ZRAM_WB_FRONT_PAD))
+
+#define bio_to_wb_read_req(bio) \
+	((struct zram_wb_read_request *)((char *)(bio) - ZRAM_WB_FRONT_PAD))
 
 /* 
  * 内部辅助函数：尝试分配指定长度的连续区间
@@ -521,21 +578,37 @@ static unsigned long alloc_block_bdev_range(struct zram *zram, int count)
 	/*
 	 * 自动对齐：尝试让起始索引按 count 对齐 (前提 count 是 2 的幂)
      * 这样可以显著提高底层块设备的合并效率
-     */
+	 */
     unsigned long align_mask = (unsigned long)count - 1;
 
-	spin_lock_irqsave(&zram->bitmap_lock, flags);
-	blk_idx = bitmap_find_next_zero_area(zram->bitmap, zram->nr_pages,
+	spin_lock_irqsave(&zram->wb->bitmap_lock, flags);
+	if (zram->wb->dirty_free_bitmap) {
+		blk_idx = bitmap_find_next_zero_area(zram->wb->bitmap, zram->wb->nr_pages,
 					     blk_idx, count, align_mask);
-	if (blk_idx < zram->nr_pages)
-		bitmap_set(zram->bitmap, blk_idx, count);
-	spin_unlock_irqrestore(&zram->bitmap_lock, flags);
+		while (blk_idx < zram->wb->nr_pages) {
+			if (bitmap_weight(zram->wb->dirty_free_bitmap + BIT_WORD(blk_idx),
+					 min_t(unsigned long, count,
+					       zram->wb->nr_pages - blk_idx)) == count)
+				break;
+			blk_idx = bitmap_find_next_zero_area(zram->wb->bitmap, zram->wb->nr_pages,
+					     blk_idx + 1, count, align_mask);
+		}
+	}
+	if (blk_idx >= zram->wb->nr_pages)
+	blk_idx = bitmap_find_next_zero_area(zram->wb->bitmap, zram->wb->nr_pages,
+					     blk_idx, count, align_mask);
+	if (blk_idx < zram->wb->nr_pages) {
+		bitmap_set(zram->wb->bitmap, blk_idx, count);
+		if (zram->wb->dirty_free_bitmap)
+			bitmap_clear(zram->wb->dirty_free_bitmap, blk_idx, count);
+	}
+	spin_unlock_irqrestore(&zram->wb->bitmap_lock, flags);
 
-	if (blk_idx >= zram->nr_pages)
+	if (blk_idx >= zram->wb->nr_pages)
 		return 0;
 
 	/* 成功分配 */
-	atomic64_add(count, &zram->stats.bd_count);
+	percpu_counter_add(&zram->stats.bd_count, count);
 	return blk_idx;
 }
 
@@ -580,13 +653,13 @@ void free_block_bdev_range(struct zram *zram, unsigned long blk_idx, int count)
 	 * 注意：这里假设调用者保证了范围的合法性
 	 * 逐个清除位
 	 */
-	spin_lock_irqsave(&zram->bitmap_lock, flags);
+	spin_lock_irqsave(&zram->wb->bitmap_lock, flags);
 	for (i = 0; i < count; i++) {
-		if (!test_and_clear_bit(blk_idx + i, zram->bitmap))
+		if (!test_and_clear_bit(blk_idx + i, zram->wb->bitmap))
 			WARN_ON_ONCE(1); /* 释放了未分配的块 */
 	}
-	spin_unlock_irqrestore(&zram->bitmap_lock, flags);
-	atomic64_sub(count, &zram->stats.bd_count);
+	spin_unlock_irqrestore(&zram->wb->bitmap_lock, flags);
+	percpu_counter_sub(&zram->stats.bd_count, count);
 }
 
 /* 保持原有单块释放函数的兼容性 */
@@ -619,7 +692,7 @@ static void complete_wb_batch(struct zram_wb_batch_request *req)
 			goto handle_err;
 
 		/* 更新统计 */
-		atomic64_inc(&zram->stats.bd_writes);
+		percpu_counter_inc(&zram->stats.bd_writes);
 
 		/* 锁定槽位进行状态变更 */
 		zram_slot_lock(zram, index);
@@ -639,13 +712,13 @@ static void complete_wb_batch(struct zram_wb_batch_request *req)
 		zram_set_wb_handle(zram, index, req->start_blk_idx,
 				   sub->cluster_off, req->count);
 		zram->table[index].migration_count = 0;
-		atomic64_inc(&zram->stats.pages_stored);
+		percpu_counter_inc(&zram->stats.pages_stored);
 
 		/* 更新写回限制配额 */
-		spin_lock(&zram->wb_limit_lock);
-		if (zram->wb_limit_enable && zram->bd_wb_limit > 0)
-			zram->bd_wb_limit -=  1UL << (PAGE_SHIFT - 12);
-		spin_unlock(&zram->wb_limit_lock);
+		spin_lock(&zram->wb->wb_limit_lock);
+		if (zram->wb->wb_limit_enable && zram->wb->bd_wb_limit > 0)
+			zram->wb->bd_wb_limit -=  1UL << (PAGE_SHIFT - 12);
+		spin_unlock(&zram->wb->wb_limit_lock);
 
 		zram_slot_unlock(zram, index);
 		
@@ -762,6 +835,57 @@ static void zram_writeback_end_io(struct bio *bio)
 	wake_up(&wb_wq);
 }
 
+static void zram_read_wb_end_io(struct bio *bio)
+{
+	struct zram_wb_read_request *req = bio_to_wb_read_req(bio);
+
+	req->error = blk_status_to_errno(bio->bi_status);
+	complete(&req->done);
+}
+
+int zram_read_wb_pages_sync(struct zram *zram, struct page **pages,
+				  unsigned long start_entry, unsigned int nr_pages)
+{
+	struct zram_wb_read_request *req;
+	struct bio *bio;
+	unsigned int i;
+	int ret;
+
+	if (!nr_pages)
+		return 0;
+
+	bio = bio_alloc_bioset(zram->wb->bdev, nr_pages, REQ_OP_READ,
+			       GFP_NOIO, &zram_wb_bs);
+	if (!bio)
+		return -ENOMEM;
+
+	req = bio_to_wb_read_req(bio);
+	init_completion(&req->done);
+	req->zram = zram;
+	req->bio = bio;
+	req->pages = pages;
+	req->count = nr_pages;
+	req->error = 0;
+
+	bio->bi_iter.bi_sector = start_entry * (PAGE_SIZE >> 9);
+	bio->bi_end_io = zram_read_wb_end_io;
+
+	for (i = 0; i < nr_pages; i++) {
+		ret = bio_add_page(bio, pages[i], PAGE_SIZE, 0);
+		if (ret != PAGE_SIZE) {
+			bio_put(bio);
+			return -EIO;
+		}
+	}
+
+	submit_bio(bio);
+	wait_for_completion(&req->done);
+	ret = req->error;
+	bio_put(bio);
+
+	return ret;
+}
+
 /* 
  * 外部接口：分配一个新的批次请求 
  */
@@ -777,7 +901,7 @@ struct zram_wb_batch_request *alloc_wb_batch_request(struct zram *zram,
 	 * ZRAM_WB_MAX_BATCH_SIZE 定义了 bio_vec 的最大数量。
 	 * front_pad 会自动被 bio_alloc 分配在 bio 之前。
 	 */
-	bio = bio_alloc_bioset(zram->bdev, ZRAM_WB_MAX_BATCH_SIZE, 
+	bio = bio_alloc_bioset(zram->wb->bdev, ZRAM_WB_MAX_BATCH_SIZE, 
 			       REQ_OP_WRITE, GFP_NOIO,
 			       &zram_wb_bs);
 	if (!bio)

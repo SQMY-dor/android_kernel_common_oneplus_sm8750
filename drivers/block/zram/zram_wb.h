@@ -26,10 +26,10 @@ struct zram_wb_batch_request {
 	struct zram_pp_ctl *ppctl;
 	struct bio *bio;
 	struct list_head node;
+	unsigned long start_blk_idx;
 	
 	/* 当前批次中包含的有效子请求数量 */
 	unsigned int count;
-	unsigned long start_blk_idx;
 	
 	/* 记录每个页面的元数据，用于回调时释放资源 */
 	struct zram_wb_sub_req sub_reqs[ZRAM_WB_MAX_BATCH_SIZE];
@@ -39,6 +39,44 @@ struct zram_wb_request_list {
 	struct list_head head;
 	int count;
 	spinlock_t lock;
+};
+
+struct zram_wb_frag_score {
+	unsigned long cluster_base;
+	unsigned int used;
+	unsigned int holes;
+	unsigned int max_run;
+	unsigned int transitions;
+	unsigned int score;
+};
+
+struct zram_wb_memcg_group {
+	u16 memcg_id;
+	u16 count;
+};
+
+struct zram_work {
+	struct work_struct work;
+	struct zram *zram;
+	unsigned long entry;
+	struct page *page;
+	int error;
+};
+
+struct zram_wb_read_request {
+	struct completion done;
+	struct zram *zram;
+	struct bio *bio;
+	struct page **pages;
+	unsigned int count;
+	int error;
+};
+
+struct zram_shrink_work {
+	struct zram *zram;
+	unsigned long candidates[BATCH_SIZE];
+	struct zram_pp_ctl *ctl;
+	int nr_candidates;
 };
 
 #if IS_ENABLED(CONFIG_ZRAM_WRITEBACK)
@@ -54,6 +92,8 @@ void zram_init_gc(struct zram *zram);
 struct zram_wb_batch_request *alloc_wb_batch_request(struct zram *zram,
 						     struct zram_pp_ctl *ctl,
 						     unsigned long start_blk_idx);
+int zram_read_wb_pages_sync(struct zram *zram, struct page **pages,
+				  unsigned long start_entry, unsigned int nr_pages);
 
 int setup_zram_writeback(void);
 void destroy_zram_writeback(void);
