@@ -574,6 +574,7 @@ void zram_init_gc(struct zram *zram)
 static unsigned long alloc_block_bdev_range(struct zram *zram, int count)
 {
 	unsigned long blk_idx = 1; /* skip 0 bit */
+	unsigned long fallback_blk_idx = 1; /* skip 0 bit */
 	unsigned long flags;
 	/*
 	 * 自动对齐：尝试让起始索引按 count 对齐 (前提 count 是 2 的幂)
@@ -595,8 +596,10 @@ static unsigned long alloc_block_bdev_range(struct zram *zram, int count)
 		}
 	}
 	if (blk_idx >= zram->wb->nr_pages)
-	blk_idx = bitmap_find_next_zero_area(zram->wb->bitmap, zram->wb->nr_pages,
-					     blk_idx, count, align_mask);
+		blk_idx = bitmap_find_next_zero_area(zram->wb->bitmap,
+					     zram->wb->nr_pages,
+					     fallback_blk_idx,
+					     count, align_mask);
 	if (blk_idx < zram->wb->nr_pages) {
 		bitmap_set(zram->wb->bitmap, blk_idx, count);
 		if (zram->wb->dirty_free_bitmap)
