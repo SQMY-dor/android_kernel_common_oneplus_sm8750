@@ -102,6 +102,9 @@ struct zram_table_entry {
 #define ZRAM_SHADOW_CACHE_TTL_GROW_STEP	(HZ / 2)
 #define ZRAM_SHADOW_CACHE_TTL_SHRINK_STEP	(HZ)
 #define ZRAM_SHADOW_HIT_WINDOW	64
+#define ZRAM_SHADOW_PREFETCH_TRIGGER_WINDOW	4
+#define ZRAM_SHADOW_PREFETCH_PENDING_TTL	HZ
+#define ZRAM_SHADOW_PREFETCH_MAX_ACTIVE	1
 #define ZRAM_GC_PERIODIC_INTERVAL	(15 * HZ)
 #define ZRAM_GC_PERIODIC_PAGES	16
 #define ZRAM_GC_MAX_SCAN_CLUSTERS	128
@@ -136,6 +139,7 @@ struct zram_shadow_prefetch {
 	struct work_struct work;
 	struct zram *zram;
 	unsigned long cluster_base;
+	u32 cluster_off;
 	u32 nr_pages;
 };
 #endif
@@ -192,11 +196,17 @@ struct zram_wb_state {
 	struct delayed_work gc_periodic_work;
 	struct list_head shadow_caches;
 	struct list_head shadow_prefetches;
+	struct workqueue_struct *prefetch_wq;
 	spinlock_t wb_limit_lock;
 	spinlock_t bitmap_lock;
 	spinlock_t shadow_lock;
 	atomic_t shrinker_writeback_in_progress;
 	atomic_t gc_pending;
+	unsigned long *shadow_prefetch_pending;
+	unsigned long *shadow_prefetch_inflight;
+	unsigned long *shadow_prefetch_first_ts;
+	u8 *shadow_prefetch_first_off;
+	unsigned long shadow_prefetch_nr_clusters;
 	u32 gc_target_pages;
 	u32 shadow_cache_bytes;
 	u32 shadow_cache_limit;

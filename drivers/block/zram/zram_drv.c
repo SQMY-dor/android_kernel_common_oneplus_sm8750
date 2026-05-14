@@ -262,6 +262,114 @@ zram_shadow_prefetch_find_locked(struct zram *zram,
 	return NULL;
 }
 
+static unsigned long zram_shadow_prefetch_cluster_idx(
+		unsigned long cluster_base)
+{
+	return cluster_base >> ZRAM_WB_CLUSTER_SHIFT;
+}
+
+static void zram_shadow_prefetch_record_first_touch_locked(struct zram *zram,
+		unsigned long cluster_idx, u32 cluster_off)
+{
+	if (cluster_idx >= zram->wb->shadow_prefetch_nr_clusters ||
+	    !zram->wb->shadow_prefetch_pending ||
+	    !zram->wb->shadow_prefetch_first_off ||
+	    !zram->wb->shadow_prefetch_first_ts)
+		return;
+
+	set_bit(cluster_idx, zram->wb->shadow_prefetch_pending);
+	clear_bit(cluster_idx, zram->wb->shadow_prefetch_inflight);
+	zram->wb->shadow_prefetch_first_off[cluster_idx] = cluster_off;
+	zram->wb->shadow_prefetch_first_ts[cluster_idx] = jiffies;
+}
+
+static void zram_shadow_prefetch_clear_pending_locked(struct zram *zram,
+		unsigned long cluster_idx)
+{
+	if (cluster_idx >= zram->wb->shadow_prefetch_nr_clusters ||
+	    !zram->wb->shadow_prefetch_pending ||
+	    !zram->wb->shadow_prefetch_first_off ||
+	    !zram->wb->shadow_prefetch_first_ts)
+		return;
+
+	clear_bit(cluster_idx, zram->wb->shadow_prefetch_pending);
+	zram->wb->shadow_prefetch_first_off[cluster_idx] = 0;
+	zram->wb->shadow_prefetch_first_ts[cluster_idx] = 0;
+}
+
+static void zram_shadow_prefetch_clear_inflight_locked(struct zram *zram,
+		unsigned long cluster_idx)
+{
+	if (cluster_idx >= zram->wb->shadow_prefetch_nr_clusters ||
+	    !zram->wb->shadow_prefetch_inflight)
+		return;
+
+	clear_bit(cluster_idx, zram->wb->shadow_prefetch_inflight);
+}
+
+static bool zram_shadow_prefetch_mark_accessed_locked(struct zram *zram,
+		unsigned long cluster_base, u32 cluster_off)
+{
+	unsigned long cluster_idx;
+	unsigned long first_ts;
+	u8 first_off;
+	unsigned int diff;
+
+	if (!zram->wb->shadow_prefetch_pending ||
+	    !zram->wb->shadow_prefetch_inflight ||
+	    !zram->wb->shadow_prefetch_first_off ||
+	    !zram->wb->shadow_prefetch_first_ts)
+		return false;
+
+	cluster_idx = zram_shadow_prefetch_cluster_idx(cluster_base);
+	if (cluster_idx >= zram->wb->shadow_prefetch_nr_clusters)
+		return false;
+
+	if (zram_shadow_cache_find_locked(zram, cluster_base) ||
+	    test_bit(cluster_idx, zram->wb->shadow_prefetch_inflight))
+		return false;
+
+	if (!test_bit(cluster_idx, zram->wb->shadow_prefetch_pending)) {
+		zram_shadow_prefetch_record_first_touch_locked(zram, cluster_idx,
+						      cluster_off);
+		return false;
+	}
+
+	first_off = zram->wb->shadow_prefetch_first_off[cluster_idx];
+	first_ts = zram->wb->shadow_prefetch_first_ts[cluster_idx];
+	if (!first_ts ||
+	    time_after(jiffies, first_ts + ZRAM_SHADOW_PREFETCH_PENDING_TTL)) {
+		zram_shadow_prefetch_record_first_touch_locked(zram, cluster_idx,
+						      cluster_off);
+		return false;
+	}
+
+	diff = cluster_off > first_off ? cluster_off - first_off :
+		first_off - cluster_off;
+	if (diff > 0 && diff <= ZRAM_SHADOW_PREFETCH_TRIGGER_WINDOW) {
+		zram_shadow_prefetch_clear_pending_locked(zram, cluster_idx);
+		set_bit(cluster_idx, zram->wb->shadow_prefetch_inflight);
+		return true;
+	}
+
+	zram_shadow_prefetch_record_first_touch_locked(zram, cluster_idx,
+					      cluster_off);
+	return false;
+}
+
+static void zram_shadow_prefetch_free_tracking(struct zram *zram)
+{
+	kvfree(zram->wb->shadow_prefetch_first_ts);
+	zram->wb->shadow_prefetch_first_ts = NULL;
+	kvfree(zram->wb->shadow_prefetch_first_off);
+	zram->wb->shadow_prefetch_first_off = NULL;
+	kvfree(zram->wb->shadow_prefetch_pending);
+	zram->wb->shadow_prefetch_pending = NULL;
+	kvfree(zram->wb->shadow_prefetch_inflight);
+	zram->wb->shadow_prefetch_inflight = NULL;
+	zram->wb->shadow_prefetch_nr_clusters = 0;
+}
+
 static void zram_shadow_prefetch_remove_locked(
 		struct zram_shadow_prefetch *prefetch)
 {
@@ -495,7 +603,10 @@ static void zram_shadow_cache_prefetch_work(struct work_struct *work)
 	struct zram_shadow_prefetch *prefetch =
 		container_of(work, struct zram_shadow_prefetch, work);
 	struct zram *zram = prefetch->zram;
+	unsigned long cluster_idx;
 	unsigned long flags;
+
+	cluster_idx = zram_shadow_prefetch_cluster_idx(prefetch->cluster_base);
 
 	if (!READ_ONCE(zram->wb->prefetch_disabled) &&
 	    READ_ONCE(zram->wb->backing_dev) && READ_ONCE(zram->wb->bdev))
@@ -503,6 +614,7 @@ static void zram_shadow_cache_prefetch_work(struct work_struct *work)
 					   prefetch->nr_pages);
 
 	spin_lock_irqsave(&zram->wb->shadow_lock, flags);
+	zram_shadow_prefetch_clear_inflight_locked(zram, cluster_idx);
 	zram_shadow_prefetch_remove_locked(prefetch);
 	spin_unlock_irqrestore(&zram->wb->shadow_lock, flags);
 
@@ -510,28 +622,46 @@ static void zram_shadow_cache_prefetch_work(struct work_struct *work)
 }
 
 static void zram_shadow_cache_schedule_prefetch(struct zram *zram,
-		unsigned long cluster_base, unsigned int nr_pages)
+		unsigned long cluster_base, u32 cluster_off,
+		unsigned int nr_pages)
 {
 	struct zram_shadow_prefetch *prefetch;
+	unsigned long cluster_idx;
 	unsigned long flags;
+	bool should_queue;
 
 	if (nr_pages <= 1 || READ_ONCE(zram->wb->prefetch_disabled) ||
-	    !READ_ONCE(zram->wb->backing_dev) || !READ_ONCE(zram->wb->bdev))
+	    !READ_ONCE(zram->wb->backing_dev) || !READ_ONCE(zram->wb->bdev) ||
+	    !READ_ONCE(zram->wb->prefetch_wq))
+		return;
+
+	spin_lock_irqsave(&zram->wb->shadow_lock, flags);
+	should_queue = zram_shadow_prefetch_mark_accessed_locked(zram,
+						 cluster_base,
+						 cluster_off);
+	spin_unlock_irqrestore(&zram->wb->shadow_lock, flags);
+	if (!should_queue)
 		return;
 
 	prefetch = kzalloc(sizeof(*prefetch), GFP_NOWAIT | __GFP_NOWARN);
-	if (!prefetch)
+	if (!prefetch) {
+		spin_lock_irqsave(&zram->wb->shadow_lock, flags);
+		cluster_idx = zram_shadow_prefetch_cluster_idx(cluster_base);
+		zram_shadow_prefetch_record_first_touch_locked(zram, cluster_idx,
+						      cluster_off);
+		spin_unlock_irqrestore(&zram->wb->shadow_lock, flags);
 		return;
+	}
 
 	INIT_LIST_HEAD(&prefetch->node);
 	INIT_WORK(&prefetch->work, zram_shadow_cache_prefetch_work);
 	prefetch->zram = zram;
 	prefetch->cluster_base = cluster_base;
+	prefetch->cluster_off = cluster_off;
 	prefetch->nr_pages = nr_pages;
 
 	spin_lock_irqsave(&zram->wb->shadow_lock, flags);
-	if (zram_shadow_cache_find_locked(zram, cluster_base) ||
-	    zram_shadow_prefetch_find_locked(zram, cluster_base)) {
+	if (WARN_ON_ONCE(zram_shadow_prefetch_find_locked(zram, cluster_base))) {
 		spin_unlock_irqrestore(&zram->wb->shadow_lock, flags);
 		kfree(prefetch);
 		return;
@@ -539,9 +669,12 @@ static void zram_shadow_cache_schedule_prefetch(struct zram *zram,
 	list_add_tail(&prefetch->node, &zram->wb->shadow_prefetches);
 	spin_unlock_irqrestore(&zram->wb->shadow_lock, flags);
 
-	if (!queue_work(system_unbound_wq, &prefetch->work)) {
+	if (!queue_work(zram->wb->prefetch_wq, &prefetch->work)) {
 		spin_lock_irqsave(&zram->wb->shadow_lock, flags);
+		cluster_idx = zram_shadow_prefetch_cluster_idx(cluster_base);
 		zram_shadow_prefetch_remove_locked(prefetch);
+		zram_shadow_prefetch_record_first_touch_locked(zram, cluster_idx,
+						      cluster_off);
 		spin_unlock_irqrestore(&zram->wb->shadow_lock, flags);
 		kfree(prefetch);
 	}
@@ -561,6 +694,8 @@ static void zram_shadow_cache_cancel_prefetches(struct zram *zram)
 		prefetch = list_first_entry(&zram->wb->shadow_prefetches,
 					    struct zram_shadow_prefetch, node);
 		zram_shadow_prefetch_remove_locked(prefetch);
+		zram_shadow_prefetch_clear_inflight_locked(zram,
+				zram_shadow_prefetch_cluster_idx(prefetch->cluster_base));
 		spin_unlock_irqrestore(&zram->wb->shadow_lock, flags);
 
 		if (cancel_work_sync(&prefetch->work))
@@ -1397,6 +1532,7 @@ static void reset_bdev(struct zram *zram)
 	cancel_work_sync(&zram->wb->shrink_work);
 	zram_cancel_gc(zram);
 	zram_shadow_cache_purge_all(zram);
+	zram_shadow_prefetch_free_tracking(zram);
 	ctl = xchg(&zram->wb->shrink_ctl, NULL);
 	if (ctl) {
 		atomic_set(&zram->wb->shrinker_writeback_in_progress, 0);
@@ -1459,7 +1595,12 @@ static ssize_t backing_dev_store(struct device *dev,
 	struct inode *inode;
 	struct address_space *mapping;
 	unsigned int bitmap_sz;
+	unsigned int prefetch_bitmap_sz;
 	unsigned long nr_pages, *bitmap = NULL, *dirty_free_bitmap = NULL;
+	unsigned long nr_clusters;
+	unsigned long *prefetch_pending = NULL, *prefetch_inflight = NULL;
+	unsigned long *prefetch_first_ts = NULL;
+	u8 *prefetch_first_off = NULL;
 	struct block_device *bdev = NULL;
 	int err;
 	struct zram *zram = dev_to_zram(dev);
@@ -1523,6 +1664,32 @@ static ssize_t backing_dev_store(struct device *dev,
 		err = -ENOMEM;
 		goto out;
 	}
+	nr_clusters = DIV_ROUND_UP(nr_pages, ZRAM_WB_CLUSTER_SIZE);
+	prefetch_bitmap_sz = BITS_TO_LONGS(nr_clusters) * sizeof(long);
+	prefetch_pending = kvzalloc(prefetch_bitmap_sz, GFP_KERNEL);
+	if (!prefetch_pending) {
+		err = -ENOMEM;
+		goto out;
+	}
+	prefetch_inflight = kvzalloc(prefetch_bitmap_sz, GFP_KERNEL);
+	if (!prefetch_inflight) {
+		err = -ENOMEM;
+		goto out;
+	}
+	prefetch_first_ts = kvmalloc_array(nr_clusters,
+					  sizeof(*prefetch_first_ts),
+					  GFP_KERNEL | __GFP_ZERO);
+	if (!prefetch_first_ts) {
+		err = -ENOMEM;
+		goto out;
+	}
+	prefetch_first_off = kvmalloc_array(nr_clusters,
+					 sizeof(*prefetch_first_off),
+					 GFP_KERNEL | __GFP_ZERO);
+	if (!prefetch_first_off) {
+		err = -ENOMEM;
+		goto out;
+	}
 
 	reset_bdev(zram);
 
@@ -1530,6 +1697,11 @@ static ssize_t backing_dev_store(struct device *dev,
 	zram->wb->backing_dev = backing_dev;
 	zram->wb->bitmap = bitmap;
 	zram->wb->dirty_free_bitmap = dirty_free_bitmap;
+	zram->wb->shadow_prefetch_pending = prefetch_pending;
+	zram->wb->shadow_prefetch_inflight = prefetch_inflight;
+	zram->wb->shadow_prefetch_first_ts = prefetch_first_ts;
+	zram->wb->shadow_prefetch_first_off = prefetch_first_off;
+	zram->wb->shadow_prefetch_nr_clusters = nr_clusters;
 	zram->wb->nr_pages = nr_pages;
 	up_write(&zram->init_lock);
 
@@ -1538,6 +1710,10 @@ static ssize_t backing_dev_store(struct device *dev,
 
 	return len;
 out:
+	kvfree(prefetch_first_off);
+	kvfree(prefetch_first_ts);
+	kvfree(prefetch_inflight);
+	kvfree(prefetch_pending);
 	kvfree(dirty_free_bitmap);
 	kvfree(bitmap);
 
@@ -2697,6 +2873,7 @@ static int zram_read_page(struct zram *zram, struct page *page, u32 index,
 			ret = read_from_bdev(zram, page, wb_blk_idx, parent);
 			if (!ret && wb_nr_pages > 1)
 				zram_shadow_cache_schedule_prefetch(zram, cluster_base,
+					cluster_off,
 					min_t(unsigned int, wb_nr_pages,
 					      (unsigned int)(zram->wb->nr_pages - cluster_base)));
 		}
@@ -3945,6 +4122,7 @@ static int zram_add(void)
 	spin_lock_init(&zram->wb->shadow_lock);
 	INIT_LIST_HEAD(&zram->wb->shadow_caches);
 	INIT_LIST_HEAD(&zram->wb->shadow_prefetches);
+	zram->wb->prefetch_wq = NULL;
 	INIT_WORK(&zram->wb->shrink_work, zram_shrinker_writeback_work);
 	zram_init_gc(zram);
 	zram->wb->shrink_ctl = NULL;
@@ -3994,6 +4172,16 @@ static int zram_add(void)
 
 	snprintf(zram->disk->disk_name, 16, "zram%d", device_id);
 	atomic_set(&zram->pp_in_progress, 0);
+	#ifdef CONFIG_ZRAM_WRITEBACK
+	zram->wb->prefetch_wq = alloc_workqueue("zram-pf-%s",
+			WQ_UNBOUND | WQ_MEM_RECLAIM,
+			ZRAM_SHADOW_PREFETCH_MAX_ACTIVE,
+			zram->disk->disk_name);
+	if (!zram->wb->prefetch_wq) {
+		ret = -ENOMEM;
+		goto out_cleanup_disk;
+	}
+	#endif
 
 	comp_algorithm_set(zram, ZRAM_PRIMARY_COMP, default_compressor);
 
@@ -4077,6 +4265,12 @@ lru_fail:
 	unregister_shrinker(zram->wb->zram_shrinker);
 	shrinker_free(zram->wb->zram_shrinker);
 out_cleanup_disk:
+	#ifdef CONFIG_ZRAM_WRITEBACK
+	if (zram->wb && zram->wb->prefetch_wq) {
+		destroy_workqueue(zram->wb->prefetch_wq);
+		zram->wb->prefetch_wq = NULL;
+	}
+	#endif
 	put_disk(zram->disk);
 out_free_idr:
 	idr_remove(&zram_index_idr, device_id);
@@ -4139,6 +4333,10 @@ static int zram_remove(struct zram *zram)
         unregister_shrinker(zram->wb->zram_shrinker);
         shrinker_free(zram->wb->zram_shrinker);
     }
+	if (zram->wb->prefetch_wq) {
+		destroy_workqueue(zram->wb->prefetch_wq);
+		zram->wb->prefetch_wq = NULL;
+	}
 	synchronize_rcu();
     list_lru_destroy(&zram->wb->zram_list_lru);
 	#endif
