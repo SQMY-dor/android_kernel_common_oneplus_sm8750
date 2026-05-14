@@ -297,9 +297,22 @@ int zram_read_wb_page_sync(struct zram *zram, struct page *page,
 #endif
 
 #if defined CONFIG_ZRAM_WRITEBACK || defined CONFIG_ZRAM_MULTI_COMP
+struct zram_pp_memcg_group;
+
 struct zram_pp_slot {
 	unsigned long		index;
+	u16			memcg_id;
+	u16			bucket_id;
+	struct zram_pp_memcg_group *group;
 	struct list_head	entry;
+	struct list_head	group_entry;
+};
+
+struct zram_pp_memcg_group {
+	u16			memcg_id;
+	unsigned int		count;
+	struct list_head	node;
+	struct list_head	slots;
 };
 
 /*
@@ -311,6 +324,7 @@ struct zram_pp_slot {
 
 struct zram_pp_ctl {
 	struct list_head	pp_buckets[NUM_PP_BUCKETS];
+	struct list_head	pp_groups[NUM_PP_BUCKETS];
 	struct completion	all_done;
 	atomic_t		num_pp_slots;
 };

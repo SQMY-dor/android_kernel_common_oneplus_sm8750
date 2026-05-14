@@ -835,14 +835,62 @@ static struct zram_pp_ctl *init_pp_ctl(void)
 
 	init_completion(&ctl->all_done);
 	atomic_set(&ctl->num_pp_slots, 0);
-	for (idx = 0; idx < NUM_PP_BUCKETS; idx++)
+	for (idx = 0; idx < NUM_PP_BUCKETS; idx++) {
 		INIT_LIST_HEAD(&ctl->pp_buckets[idx]);
+		INIT_LIST_HEAD(&ctl->pp_groups[idx]);
+	}
 	return ctl;
+}
+
+static struct zram_pp_memcg_group *find_pp_memcg_group(struct zram_pp_ctl *ctl,
+		u32 bid, u16 memcg_id)
+{
+	struct zram_pp_memcg_group *group;
+
+	list_for_each_entry(group, &ctl->pp_groups[bid], node) {
+		if (group->memcg_id == memcg_id)
+			return group;
+	}
+
+	return NULL;
+}
+
+static struct zram_pp_memcg_group *get_pp_memcg_group(struct zram_pp_ctl *ctl,
+		u32 bid, u16 memcg_id)
+{
+	struct zram_pp_memcg_group *group;
+
+	group = find_pp_memcg_group(ctl, bid, memcg_id);
+	if (group)
+		return group;
+
+	group = kmalloc(sizeof(*group), GFP_NOIO | __GFP_NOWARN);
+	if (!group)
+		return NULL;
+
+	group->memcg_id = memcg_id;
+	group->count = 0;
+	INIT_LIST_HEAD(&group->node);
+	INIT_LIST_HEAD(&group->slots);
+	list_add_tail(&group->node, &ctl->pp_groups[bid]);
+
+	return group;
 }
 
 static void remove_pp_slot_from_ctl(struct zram_pp_slot *pps)
 {
+	struct zram_pp_memcg_group *group = pps->group;
+
 	list_del_init(&pps->entry);
+	if (!group)
+		return;
+
+	list_del_init(&pps->group_entry);
+	if (--group->count == 0) {
+		list_del_init(&group->node);
+		kfree(group);
+	}
+	pps->group = NULL;
 }
 
 void free_pp_slot(struct zram *zram, struct zram_pp_slot *pps)
@@ -884,18 +932,33 @@ static void release_pp_ctl(struct zram *zram, struct zram_pp_ctl *ctl)
 static bool place_pp_slot(struct zram *zram, struct zram_pp_ctl *ctl,
 			  u32 index)
 {
+	struct zram_pp_memcg_group *group;
 	struct zram_pp_slot *pps;
 	u32 bid;
+	u16 memcg_id;
 
 	pps = kmalloc(sizeof(*pps), GFP_NOIO | __GFP_NOWARN);
 	if (!pps)
 		return false;
 
 	INIT_LIST_HEAD(&pps->entry);
+	INIT_LIST_HEAD(&pps->group_entry);
 	pps->index = index;
 
 	bid = zram_get_obj_size(zram, pps->index) / PP_BUCKET_SIZE_RANGE;
+	memcg_id = READ_ONCE(zram->table[pps->index].memcg_id);
+	group = get_pp_memcg_group(ctl, bid, memcg_id);
+	if (!group) {
+		kfree(pps);
+		return false;
+	}
+
+	pps->memcg_id = memcg_id;
+	pps->bucket_id = bid;
+	pps->group = group;
 	list_add(&pps->entry, &ctl->pp_buckets[bid]);
+	list_add_tail(&pps->group_entry, &group->slots);
+	group->count++;
 
 	zram_set_flag(zram, pps->index, ZRAM_PP_SLOT);
 	return true;
@@ -917,6 +980,160 @@ static struct zram_pp_slot *select_pp_slot(struct zram_pp_ctl *ctl)
 		idx--;
 	}
 	return pps;
+}
+
+static s32 zram_wb_next_nonempty_pp_bucket(struct zram_pp_ctl *ctl, s32 start)
+{
+	while (start >= 0) {
+		if (!list_empty(&ctl->pp_groups[start]))
+			return start;
+		start--;
+	}
+
+	return -1;
+}
+
+static struct zram_pp_memcg_group *zram_wb_pick_whole_group(
+		struct zram_pp_ctl *ctl, u32 bid, unsigned int remaining)
+{
+	struct zram_pp_memcg_group *best = NULL;
+	struct zram_pp_memcg_group *group;
+
+	list_for_each_entry(group, &ctl->pp_groups[bid], node) {
+		if (group->count > remaining)
+			continue;
+		if (!best || group->count > best->count)
+			best = group;
+	}
+
+	return best;
+}
+
+static struct zram_pp_memcg_group *zram_wb_pick_split_group(
+		struct zram_pp_ctl *ctl, u32 bid, unsigned int remaining)
+{
+	struct zram_pp_memcg_group *best = NULL;
+	struct zram_pp_memcg_group *group;
+
+	list_for_each_entry(group, &ctl->pp_groups[bid], node) {
+		if (group->count <= remaining)
+			continue;
+		if (!best || group->count < best->count)
+			best = group;
+	}
+
+	return best;
+}
+
+static int zram_wb_take_memcg_slots(struct zram_pp_ctl *ctl, u32 bid,
+		u16 memcg_id, struct zram_pp_slot **batch_slots,
+		int nr_selected, int max_take)
+{
+	int taken = 0;
+
+	while (taken < max_take) {
+		struct zram_pp_memcg_group *group;
+		struct zram_pp_slot *pps;
+
+		group = find_pp_memcg_group(ctl, bid, memcg_id);
+		if (!group)
+			break;
+
+		pps = list_first_entry_or_null(&group->slots,
+				struct zram_pp_slot, group_entry);
+		if (!pps)
+			break;
+
+		remove_pp_slot_from_ctl(pps);
+		batch_slots[nr_selected + taken] = pps;
+		taken++;
+	}
+
+	return taken;
+}
+
+static void zram_wb_release_batch_plan(struct zram *zram,
+		struct zram_pp_slot **batch_slots,
+		int plan_cursor, int batch_planned)
+{
+	while (plan_cursor < batch_planned) {
+		free_pp_slot(zram, batch_slots[plan_cursor]);
+		batch_slots[plan_cursor] = NULL;
+		plan_cursor++;
+	}
+}
+
+static int zram_wb_plan_batch(struct zram_pp_ctl *ctl, int batch_capacity,
+		struct zram_pp_slot **batch_slots,
+		int *carry_bucket, u16 *carry_memcg)
+{
+	int nr_selected = 0;
+	int remaining = batch_capacity;
+	s32 bid;
+
+	if (remaining <= 0)
+		return 0;
+
+	if (*carry_bucket >= 0) {
+		int taken;
+
+		taken = zram_wb_take_memcg_slots(ctl, *carry_bucket, *carry_memcg,
+				batch_slots, nr_selected, remaining);
+		nr_selected += taken;
+		remaining -= taken;
+		if (!find_pp_memcg_group(ctl, *carry_bucket, *carry_memcg))
+			*carry_bucket = -1;
+		if (!remaining)
+			return nr_selected;
+	}
+
+	for (bid = zram_wb_next_nonempty_pp_bucket(ctl, NUM_PP_BUCKETS - 1);
+	     bid >= 0 && remaining > 0;
+	     bid = zram_wb_next_nonempty_pp_bucket(ctl, bid - 1)) {
+		while (remaining > 0) {
+			struct zram_pp_memcg_group *group;
+			int taken;
+
+			group = zram_wb_pick_whole_group(ctl, bid, remaining);
+			if (!group)
+				break;
+
+			taken = zram_wb_take_memcg_slots(ctl, bid, group->memcg_id,
+					batch_slots, nr_selected, group->count);
+			nr_selected += taken;
+			remaining -= taken;
+		}
+	}
+
+	if (!remaining)
+		return nr_selected;
+
+	for (bid = zram_wb_next_nonempty_pp_bucket(ctl, NUM_PP_BUCKETS - 1);
+	     bid >= 0 && remaining > 0;
+	     bid = zram_wb_next_nonempty_pp_bucket(ctl, bid - 1)) {
+		struct zram_pp_memcg_group *group;
+		u16 memcg_id;
+		int taken;
+
+		group = zram_wb_pick_split_group(ctl, bid, remaining);
+		if (!group)
+			continue;
+		memcg_id = group->memcg_id;
+
+		taken = zram_wb_take_memcg_slots(ctl, bid, memcg_id,
+				batch_slots, nr_selected, remaining);
+		nr_selected += taken;
+		remaining -= taken;
+		if (find_pp_memcg_group(ctl, bid, memcg_id)) {
+			*carry_bucket = bid;
+			*carry_memcg = memcg_id;
+		} else {
+			*carry_bucket = -1;
+		}
+		break;
+	}
+
+	return nr_selected;
 }
 #endif
 
@@ -1352,9 +1569,14 @@ static void read_from_bdev_async(struct zram *zram, struct page *page,
 static int zram_writeback_slots(struct zram *zram, struct zram_pp_ctl *ctl)
 {
 	unsigned long batch_base_idx = 0;
+	struct zram_pp_slot *batch_slots[ZRAM_WB_MAX_BATCH_SIZE];
 	int batch_count = 0;
+	int batch_planned = 0;
+	int plan_cursor = 0;
 	int batch_cursor = 0;
+	int carry_bucket = -1;
 	struct zram_wb_batch_request *active_req = NULL;
+	u16 carry_memcg = 0;
 	struct zram_pp_slot *pps;
 	int ret = 0;
 
@@ -1365,13 +1587,73 @@ static int zram_writeback_slots(struct zram *zram, struct zram_pp_ctl *ctl)
 	struct blk_plug plug;
 	blk_start_plug(&plug);
 
-	while ((pps = select_pp_slot(ctl))) {
+	while (1) {
 		struct page *page;
 		unsigned long current_blk_idx;
-		u32 index = pps->index;
+		u32 index;
+
+		if (plan_cursor >= batch_planned) {
+			int want_count = ZRAM_WB_MAX_BATCH_SIZE;
+
+			if (zram_wb_next_nonempty_pp_bucket(ctl,
+				    NUM_PP_BUCKETS - 1) < 0)
+				break;
+
+			if (active_req) {
+				if (active_req->count > 0)
+					submit_bio(active_req->bio);
+				else
+					bio_put(active_req->bio);
+				active_req = NULL;
+			}
+
+			if (batch_base_idx && batch_count > batch_cursor) {
+				free_block_bdev_range(zram,
+					      batch_base_idx + batch_cursor,
+					      batch_count - batch_cursor);
+			}
+
+			batch_cursor = 0;
+			batch_count = 0;
+			batch_planned = 0;
+			plan_cursor = 0;
+			batch_base_idx = alloc_block_bdev_batch(zram, want_count,
+							      &batch_count);
+			if (batch_count > 0 && batch_count < want_count)
+				zram_schedule_gc(zram, want_count);
+			if (!batch_base_idx || batch_count < want_count) {
+				if (batch_base_idx) {
+					free_block_bdev_range(zram, batch_base_idx,
+						      batch_count);
+					batch_base_idx = 0;
+					batch_count = 0;
+				}
+				batch_base_idx = alloc_block_bdev_batch(zram, want_count,
+							      &batch_count);
+			}
+
+			if (!batch_base_idx) {
+				ret = -ENOSPC;
+				break;
+			}
+
+			batch_planned = zram_wb_plan_batch(ctl, batch_count,
+						       batch_slots,
+						       &carry_bucket,
+						       &carry_memcg);
+			if (!batch_planned) {
+				free_block_bdev_range(zram, batch_base_idx, batch_count);
+				batch_base_idx = 0;
+				batch_count = 0;
+				break;
+			}
+		}
+
+		pps = batch_slots[plan_cursor++];
+		index = pps->index;
 
 		if (!zram_writeback_allowed(zram)) {
-			release_pp_slot(zram, pps);
+			free_pp_slot(zram, pps);
 			ret = -EAGAIN;
 			break;
 		}
@@ -1380,48 +1662,11 @@ static int zram_writeback_slots(struct zram *zram, struct zram_pp_ctl *ctl)
 		spin_lock(&zram->wb->wb_limit_lock);
 		if (zram->wb->wb_limit_enable && !zram->wb->bd_wb_limit) {
 			spin_unlock(&zram->wb->wb_limit_lock);
-			release_pp_slot(zram, pps);
+			free_pp_slot(zram, pps);
 			ret = -EIO;
-			break; 
+			break;
 		}
 		spin_unlock(&zram->wb->wb_limit_lock);
-
-		/* --- 2. 物理块管理 --- */
-		if (batch_cursor >= batch_count) {
-			if (active_req) {
-				submit_bio(active_req->bio);
-				active_req = NULL;
-			}
-			
-			if (batch_base_idx && batch_count > batch_cursor) {
-				free_block_bdev_range(zram, 
-						      batch_base_idx + batch_cursor, 
-						      batch_count - batch_cursor);
-			}
-
-			int want_count = ZRAM_WB_MAX_BATCH_SIZE;
-			
-			batch_cursor = 0;
-			batch_count = 0;
-			batch_base_idx = alloc_block_bdev_batch(zram, want_count, &batch_count);
-			if (batch_count > 0 && batch_count < want_count)
-				zram_schedule_gc(zram, want_count);
-			if (!batch_base_idx || batch_count < want_count) {
-				if (batch_base_idx) {
-					free_block_bdev_range(zram, batch_base_idx, batch_count);
-					batch_base_idx = 0;
-					batch_count = 0;
-				}
-				batch_base_idx = alloc_block_bdev_batch(zram, want_count,
-								&batch_count);
-			}
-			
-			if (!batch_base_idx) {
-				release_pp_slot(zram, pps);
-				ret = -ENOSPC;
-				break;
-			}
-		}
 
 		current_blk_idx = batch_base_idx + batch_cursor;
 
@@ -1429,7 +1674,7 @@ static int zram_writeback_slots(struct zram *zram, struct zram_pp_ctl *ctl)
 		if (!active_req) {
 			active_req = alloc_wb_batch_request(zram, ctl, current_blk_idx);
 			if (!active_req) {
-				release_pp_slot(zram, pps);
+				free_pp_slot(zram, pps);
 				ret = -ENOMEM;
 				break;
 			}
@@ -1445,7 +1690,7 @@ static int zram_writeback_slots(struct zram *zram, struct zram_pp_ctl *ctl)
 				bio_put(active_req->bio);
 				active_req = NULL;
 			}
-			release_pp_slot(zram, pps);
+			free_pp_slot(zram, pps);
 			ret = -ENOMEM;
 			break;
 		}
@@ -1455,14 +1700,14 @@ static int zram_writeback_slots(struct zram *zram, struct zram_pp_ctl *ctl)
 		if (!zram_test_flag(zram, index, ZRAM_PP_SLOT)) {
 			zram_slot_unlock(zram, index);
 			__free_page(page);
-			release_pp_slot(zram, pps);
+			free_pp_slot(zram, pps);
 			continue;
 		}
 		zram_slot_unlock(zram, index);
 
 		if (zram_read_page(zram, page, index, NULL)) {
 			__free_page(page);
-			release_pp_slot(zram, pps);
+			free_pp_slot(zram, pps);
 			continue;
 		}
 
@@ -1474,7 +1719,7 @@ static int zram_writeback_slots(struct zram *zram, struct zram_pp_ctl *ctl)
 			active_req = alloc_wb_batch_request(zram, ctl, current_blk_idx);
 			if (!active_req) {
 				__free_page(page);
-				release_pp_slot(zram, pps);
+				free_pp_slot(zram, pps);
 				ret = -ENOMEM;
 				break;
 			}
@@ -1483,7 +1728,7 @@ static int zram_writeback_slots(struct zram *zram, struct zram_pp_ctl *ctl)
 				bio_put(active_req->bio);
 				active_req = NULL;
 				__free_page(page);
-				release_pp_slot(zram, pps);
+				free_pp_slot(zram, pps);
 				ret = -EIO;
 				break;
 			}
@@ -1500,8 +1745,7 @@ static int zram_writeback_slots(struct zram *zram, struct zram_pp_ctl *ctl)
 		active_req->sub_reqs[idx].cluster_off = current_blk_idx -
 							 active_req->start_blk_idx;
 
-		remove_pp_slot_from_ctl(pps);
-		batch_cursor++; 
+		batch_cursor++;
 		
 		if (active_req->count >= ZRAM_WB_MAX_BATCH_SIZE) {
 			submit_bio(active_req->bio);
@@ -1511,9 +1755,14 @@ static int zram_writeback_slots(struct zram *zram, struct zram_pp_ctl *ctl)
 
 	/* 循环结束，提交残留的 BIO */
 	if (active_req) {
-		submit_bio(active_req->bio);
+		if (active_req->count > 0)
+			submit_bio(active_req->bio);
+		else
+			bio_put(active_req->bio);
 		active_req = NULL;
 	}
+
+	zram_wb_release_batch_plan(zram, batch_slots, plan_cursor, batch_planned);
 
 	blk_finish_plug(&plug);
 
