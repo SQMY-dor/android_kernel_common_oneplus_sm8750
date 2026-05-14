@@ -2281,10 +2281,10 @@ static int zram_read_page(struct zram *zram, struct page *page, u32 index,
 		zram_slot_unlock(zram, index);
 
 		ret = -ENOENT;
-		if (wb_nr_pages > 1 && !parent)
+		if (wb_nr_pages > 1)
 			ret = zram_shadow_cache_copy(zram, page, index,
 						     cluster_base, cluster_off);
-		if (ret == -ENOENT && wb_nr_pages > 1 && !parent) {
+		if (ret == -ENOENT && wb_nr_pages > 1) {
 			if (READ_ONCE(zram->wb->prefetch_disabled))
 				ret = read_from_bdev(zram, page, wb_blk_idx, parent);
 			else
