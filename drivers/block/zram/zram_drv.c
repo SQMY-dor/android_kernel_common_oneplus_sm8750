@@ -248,6 +248,27 @@ zram_shadow_cache_find_locked(struct zram *zram, unsigned long cluster_base)
 	return NULL;
 }
 
+static struct zram_shadow_prefetch *
+zram_shadow_prefetch_find_locked(struct zram *zram,
+		unsigned long cluster_base)
+{
+	struct zram_shadow_prefetch *prefetch;
+
+	list_for_each_entry(prefetch, &zram->wb->shadow_prefetches, node) {
+		if (prefetch->cluster_base == cluster_base)
+			return prefetch;
+	}
+
+	return NULL;
+}
+
+static void zram_shadow_prefetch_remove_locked(
+		struct zram_shadow_prefetch *prefetch)
+{
+	if (!list_empty(&prefetch->node))
+		list_del_init(&prefetch->node);
+}
+
 static void zram_shadow_cache_remove_locked(struct zram *zram,
 		struct zram_shadow_cache *cache)
 {
@@ -383,9 +404,10 @@ static int zram_shadow_cache_prefetch(struct zram *zram,
 	struct zram_shadow_cache *cache;
 	unsigned long flags;
 	unsigned int i;
+	gfp_t gfp = GFP_NOIO | __GFP_NOWARN;
 	int ret;
 
-	cache = kzalloc(sizeof(*cache), GFP_KERNEL);
+	cache = kzalloc(sizeof(*cache), gfp);
 	if (!cache)
 		return -ENOMEM;
 
@@ -395,12 +417,12 @@ static int zram_shadow_cache_prefetch(struct zram *zram,
 	cache->cluster_base = cluster_base;
 	cache->ttl_jiffies = zram->wb->shadow_ttl_jiffies;
 	cache->nr_pages = nr_pages;
-	cache->pages = kcalloc(nr_pages, sizeof(*cache->pages), GFP_KERNEL);
+	cache->pages = kcalloc(nr_pages, sizeof(*cache->pages), gfp);
 	if (!cache->pages) {
 		ret = -ENOMEM;
 		goto err_free;
 	}
-	cache->indexes = kmalloc_array(nr_pages, sizeof(*cache->indexes), GFP_KERNEL);
+	cache->indexes = kmalloc_array(nr_pages, sizeof(*cache->indexes), gfp);
 	if (!cache->indexes) {
 		ret = -ENOMEM;
 		goto err_free;
@@ -409,7 +431,7 @@ static int zram_shadow_cache_prefetch(struct zram *zram,
 		cache->indexes[i] = U32_MAX;
 
 	for (i = 0; i < nr_pages; i++) {
-		cache->pages[i] = alloc_page(GFP_KERNEL);
+		cache->pages[i] = alloc_page(gfp);
 		if (!cache->pages[i]) {
 			ret = -ENOMEM;
 			goto err_free;
@@ -468,10 +490,90 @@ err_free:
 	return ret;
 }
 
+static void zram_shadow_cache_prefetch_work(struct work_struct *work)
+{
+	struct zram_shadow_prefetch *prefetch =
+		container_of(work, struct zram_shadow_prefetch, work);
+	struct zram *zram = prefetch->zram;
+	unsigned long flags;
+
+	if (!READ_ONCE(zram->wb->prefetch_disabled) &&
+	    READ_ONCE(zram->wb->backing_dev) && READ_ONCE(zram->wb->bdev))
+		zram_shadow_cache_prefetch(zram, prefetch->cluster_base,
+					   prefetch->nr_pages);
+
+	spin_lock_irqsave(&zram->wb->shadow_lock, flags);
+	zram_shadow_prefetch_remove_locked(prefetch);
+	spin_unlock_irqrestore(&zram->wb->shadow_lock, flags);
+
+	kfree(prefetch);
+}
+
+static void zram_shadow_cache_schedule_prefetch(struct zram *zram,
+		unsigned long cluster_base, unsigned int nr_pages)
+{
+	struct zram_shadow_prefetch *prefetch;
+	unsigned long flags;
+
+	if (nr_pages <= 1 || READ_ONCE(zram->wb->prefetch_disabled) ||
+	    !READ_ONCE(zram->wb->backing_dev) || !READ_ONCE(zram->wb->bdev))
+		return;
+
+	prefetch = kzalloc(sizeof(*prefetch), GFP_NOWAIT | __GFP_NOWARN);
+	if (!prefetch)
+		return;
+
+	INIT_LIST_HEAD(&prefetch->node);
+	INIT_WORK(&prefetch->work, zram_shadow_cache_prefetch_work);
+	prefetch->zram = zram;
+	prefetch->cluster_base = cluster_base;
+	prefetch->nr_pages = nr_pages;
+
+	spin_lock_irqsave(&zram->wb->shadow_lock, flags);
+	if (zram_shadow_cache_find_locked(zram, cluster_base) ||
+	    zram_shadow_prefetch_find_locked(zram, cluster_base)) {
+		spin_unlock_irqrestore(&zram->wb->shadow_lock, flags);
+		kfree(prefetch);
+		return;
+	}
+	list_add_tail(&prefetch->node, &zram->wb->shadow_prefetches);
+	spin_unlock_irqrestore(&zram->wb->shadow_lock, flags);
+
+	if (!queue_work(system_unbound_wq, &prefetch->work)) {
+		spin_lock_irqsave(&zram->wb->shadow_lock, flags);
+		zram_shadow_prefetch_remove_locked(prefetch);
+		spin_unlock_irqrestore(&zram->wb->shadow_lock, flags);
+		kfree(prefetch);
+	}
+}
+
+static void zram_shadow_cache_cancel_prefetches(struct zram *zram)
+{
+	struct zram_shadow_prefetch *prefetch;
+	unsigned long flags;
+
+	for (;;) {
+		spin_lock_irqsave(&zram->wb->shadow_lock, flags);
+		if (list_empty(&zram->wb->shadow_prefetches)) {
+			spin_unlock_irqrestore(&zram->wb->shadow_lock, flags);
+			break;
+		}
+		prefetch = list_first_entry(&zram->wb->shadow_prefetches,
+					    struct zram_shadow_prefetch, node);
+		zram_shadow_prefetch_remove_locked(prefetch);
+		spin_unlock_irqrestore(&zram->wb->shadow_lock, flags);
+
+		if (cancel_work_sync(&prefetch->work))
+			kfree(prefetch);
+	}
+}
+
 static void zram_shadow_cache_purge_all(struct zram *zram)
 {
 	struct zram_shadow_cache *cache;
 	unsigned long flags;
+
+	zram_shadow_cache_cancel_prefetches(zram);
 
 	for (;;) {
 		spin_lock_irqsave(&zram->wb->shadow_lock, flags);
@@ -2342,19 +2444,13 @@ static int zram_read_page(struct zram *zram, struct page *page, u32 index,
 		if (wb_nr_pages > 1)
 			ret = zram_shadow_cache_copy(zram, page, index,
 						     cluster_base, cluster_off);
-		if (ret == -ENOENT && wb_nr_pages > 1) {
-			if (READ_ONCE(zram->wb->prefetch_disabled))
-				ret = read_from_bdev(zram, page, wb_blk_idx, parent);
-			else
-				ret = zram_shadow_cache_prefetch(zram, cluster_base,
-						 min_t(unsigned int, wb_nr_pages,
-						       (unsigned int)(zram->wb->nr_pages - cluster_base)));
-			if (!ret)
-				ret = zram_shadow_cache_copy(zram, page, index,
-							 cluster_base, cluster_off);
-		}
-		if (ret == -ENOENT)
+		if (ret == -ENOENT) {
 			ret = read_from_bdev(zram, page, wb_blk_idx, parent);
+			if (!ret && wb_nr_pages > 1)
+				zram_shadow_cache_schedule_prefetch(zram, cluster_base,
+					min_t(unsigned int, wb_nr_pages,
+					      (unsigned int)(zram->wb->nr_pages - cluster_base)));
+		}
 	}
 
 	/* Should NEVER happen. Return bio error if it does. */
@@ -3599,6 +3695,7 @@ static int zram_add(void)
 	spin_lock_init(&zram->wb->bitmap_lock);
 	spin_lock_init(&zram->wb->shadow_lock);
 	INIT_LIST_HEAD(&zram->wb->shadow_caches);
+	INIT_LIST_HEAD(&zram->wb->shadow_prefetches);
 	INIT_WORK(&zram->wb->shrink_work, zram_shrinker_writeback_work);
 	zram_init_gc(zram);
 	zram->wb->shrink_ctl = NULL;

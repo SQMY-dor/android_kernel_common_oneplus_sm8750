@@ -130,6 +130,14 @@ struct zram_shadow_cache {
 	u32 age_seq;
 	u32 bytes;
 };
+
+struct zram_shadow_prefetch {
+	struct list_head node;
+	struct work_struct work;
+	struct zram *zram;
+	unsigned long cluster_base;
+	u32 nr_pages;
+};
 #endif
 
 struct zram_stats {
@@ -183,6 +191,7 @@ struct zram_wb_state {
 	struct work_struct gc_work;
 	struct delayed_work gc_periodic_work;
 	struct list_head shadow_caches;
+	struct list_head shadow_prefetches;
 	spinlock_t wb_limit_lock;
 	spinlock_t bitmap_lock;
 	spinlock_t shadow_lock;
