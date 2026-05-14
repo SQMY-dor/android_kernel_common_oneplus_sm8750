@@ -62,6 +62,11 @@
 
 static void zram_clear_flag(struct zram *zram, u32 index,
 			enum zram_pageflags flag);
+static inline bool init_done(struct zram *zram);
+static inline s64 zram_stat_read(struct percpu_counter *counter)
+{
+	return percpu_counter_read_positive(counter);
+}
 
 static u64 batch_size = 768;
 
@@ -74,9 +79,84 @@ static DEFINE_MUTEX(zram_index_mutex);
 static int zram_major;
 static const char *default_compressor = CONFIG_ZRAM_DEF_COMP;
 
-static inline s64 zram_stat_read(struct percpu_counter *counter)
+bool free_zram_is_ok(void)
 {
-	return percpu_counter_read_positive(counter);
+	struct zram *zram;
+	int id;
+	bool ok = false;
+
+	mutex_lock(&zram_index_mutex);
+	idr_for_each_entry(&zram_index_idr, zram, id) {
+		unsigned long stored_pages;
+		unsigned long disksize_pages;
+
+		down_read(&zram->init_lock);
+		if (!init_done(zram)) {
+			up_read(&zram->init_lock);
+			continue;
+		}
+
+		stored_pages = zram_stat_read(&zram->stats.pages_stored);
+		disksize_pages = zram->disksize >> PAGE_SHIFT;
+		if (stored_pages < disksize_pages &&
+		    (!zram->limit_pages || stored_pages < zram->limit_pages)) {
+			ok = true;
+			up_read(&zram->init_lock);
+			break;
+		}
+		up_read(&zram->init_lock);
+	}
+	mutex_unlock(&zram_index_mutex);
+
+	return ok;
+}
+
+bool zram_get_opt_stats(struct zram_opt_stats *stats)
+{
+	struct zram *zram;
+	int id;
+	bool found = false;
+
+	if (!stats)
+		return false;
+
+	memset(stats, 0, sizeof(*stats));
+
+	mutex_lock(&zram_index_mutex);
+	idr_for_each_entry(&zram_index_idr, zram, id) {
+		unsigned long stored_pages;
+		unsigned long disksize_pages;
+
+		down_read(&zram->init_lock);
+		if (!init_done(zram)) {
+			up_read(&zram->init_lock);
+			continue;
+		}
+
+		found = true;
+		stored_pages = zram_stat_read(&zram->stats.pages_stored);
+		disksize_pages = zram->disksize >> PAGE_SHIFT;
+
+		stats->pages_stored += stored_pages;
+		stats->huge_pages += zram_stat_read(&zram->stats.huge_pages);
+		stats->compr_data_size += zram_stat_read(&zram->stats.compr_data_size);
+		stats->writestall += atomic64_read(&zram->stats.writestall);
+		stats->disksize_pages += disksize_pages;
+		stats->limit_pages += zram->limit_pages;
+		if (stored_pages < disksize_pages &&
+		    (!zram->limit_pages || stored_pages < zram->limit_pages))
+			stats->has_capacity = true;
+#ifdef CONFIG_ZRAM_WRITEBACK
+		stats->bd_reads += zram_stat_read(&zram->stats.bd_reads);
+		stats->bd_writes += zram_stat_read(&zram->stats.bd_writes);
+		if (zram->wb && zram->wb->backing_dev)
+			stats->has_writeback = true;
+#endif
+		up_read(&zram->init_lock);
+	}
+	mutex_unlock(&zram_index_mutex);
+
+	return found;
 }
 
 static int zram_stats_init(struct zram *zram)
@@ -4367,6 +4447,10 @@ static int __init zram_init(void)
 	if (ret)
 		goto out_destroy_writeback;
 
+	ret = zram_opt_init();
+	if (ret)
+		goto out_memcg;
+
 #ifdef CONFIG_ZRAM_WRITEBACK
 	monitor_thread = kthread_run(monitor_func, NULL, "zram_monitor");
 #endif
@@ -4381,6 +4465,9 @@ static int __init zram_init(void)
 #endif //CONFIG_ZRAM_MULTI_COMP
 
 	return 0;
+
+out_memcg:
+	zram_memcg_exit();
 
 out_destroy_writeback:
 	destroy_zram_writeback();
@@ -4402,6 +4489,7 @@ static void __exit zram_exit(void)
 	unregister_sysctl_table(zram_sysctl_table_header);
 #endif //CONFIG_ZRAM_MULTI_COMP
 
+	zram_opt_exit();
 	zram_memcg_exit();
 	destroy_zram_writeback();
 	destroy_devices();
