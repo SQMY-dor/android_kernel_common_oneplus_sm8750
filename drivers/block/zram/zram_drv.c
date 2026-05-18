@@ -800,7 +800,13 @@ static inline struct zram *dev_to_zram(struct device *dev)
 #ifdef CONFIG_ZRAM_WRITEBACK
 static bool zram_writeback_allowed(struct zram *zram)
 {
-	return !READ_ONCE(zram->wb->stop_writeback);
+	if (READ_ONCE(zram->wb->stop_writeback))
+		return false;
+
+	if (check_screen_off_state())
+		return false;
+
+	return true;
 }
 #endif
 

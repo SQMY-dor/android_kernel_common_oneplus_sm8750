@@ -10,6 +10,7 @@
 #include <linux/freezer.h>
 #include <linux/blkdev.h>
 #include <linux/wait_bit.h>
+#include <linux/sysms_finder.h>
 
 #include "zram_wb.h"
 
@@ -62,7 +63,13 @@ static void zram_gc_periodic_workfn(struct work_struct *work)
 
 static bool zram_wb_allowed(struct zram *zram)
 {
-	return !READ_ONCE(zram->wb->stop_writeback);
+	if (READ_ONCE(zram->wb->stop_writeback))
+		return false;
+
+	if (check_screen_off_state())
+		return false;
+
+	return true;
 }
 
 static void zram_wb_clear_flag(struct zram *zram, u32 index,
