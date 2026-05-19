@@ -42,6 +42,7 @@
 #include <linux/sched/loadavg.h>
 #include <linux/sysms_finder.h>
 #include <linux/suspend.h>
+#include <linux/ktime.h>
 
 #ifdef CONFIG_ZRAM_AUTO_SIZE
 #include <linux/math64.h>
@@ -56,13 +57,27 @@
 #include "zram_drv.h"
 #include "zram_wb.h"
 
-#define CHECK_INTERVAL (30 * HZ) // 每30秒检查一次
+#define CHECK_INTERVAL (10 * HZ) // 每10秒检查一次
 #define MEM_THRESHOLD 80
 #define IO_PSI_STOP_WRITEBACK_THRESHOLD 10
+#define ZRAM_WB_SLOW_READ_THRESHOLD_MS 200
+#define ZRAM_WB_SLOWPATH_COOLDOWN (5 * HZ)
+#define ZRAM_SHADOW_PREFETCH_HIGH_WMARK_PCT 90
+#define ZRAM_SHADOW_PREFETCH_LOW_WMARK_PCT 65
+#define ZRAM_SHADOW_PREFETCH_COOLDOWN (10 * HZ)
+#define ZRAM_SHADOW_PREFETCH_BLOCKED_TTL_SHRINK_PCT 30
+#define ZRAM_SHADOW_PREFETCH_BLOCKED_LIMIT_BOOST_PCT 85
+#define ZRAM_SHADOW_PREFETCH_MIN_HIT_RATE_PCT 10
 
 static void zram_clear_flag(struct zram *zram, u32 index,
 			enum zram_pageflags flag);
 static inline bool init_done(struct zram *zram);
+
+#ifdef CONFIG_ZRAM_WRITEBACK
+void zram_wb_record_slow_read(struct zram *zram, unsigned long entry,
+			      u64 latency_ns);
+#endif
+
 static inline s64 zram_stat_read(struct percpu_counter *counter)
 {
 	return percpu_counter_read_positive(counter);
@@ -71,6 +86,12 @@ static inline s64 zram_stat_read(struct percpu_counter *counter)
 static u64 batch_size = 768;
 
 static struct task_struct *monitor_thread;
+
+enum zram_shadow_prefetch_gate {
+	ZRAM_SHADOW_PREFETCH_GATE_ALLOWED = 0,
+	ZRAM_SHADOW_PREFETCH_GATE_BLOCKED_HWM,
+	ZRAM_SHADOW_PREFETCH_GATE_BLOCKED_COOLDOWN,
+};
 
 static DEFINE_IDR(zram_index_idr);
 /* idr index must be protected */
@@ -165,6 +186,15 @@ static int zram_stats_init(struct zram *zram)
 	atomic64_set(&stats->reject_reclaim_fail, 0);
 	atomic64_set(&stats->prefetch_total, 0);
 	atomic64_set(&stats->prefetch_hits, 0);
+	atomic64_set(&stats->prefetch_accesses, 0);
+	atomic64_set(&stats->prefetched_pages, 0);
+	atomic64_set(&stats->prefetch_evicted, 0);
+	atomic64_set(&stats->prefetch_expired, 0);
+	atomic64_set(&stats->prefetch_blocked, 0);
+	atomic64_set(&stats->prefetch_cooldown, 0);
+	atomic64_set(&stats->prefetch_zero_hits, 0);
+	atomic64_set(&stats->prefetch_single_hits, 0);
+	atomic64_set(&stats->prefetch_multi_hits, 0);
 
 	atomic_long_set(&stats->max_used_pages, 0);
 	return 0;
@@ -262,6 +292,15 @@ zram_shadow_prefetch_find_locked(struct zram *zram,
 	return NULL;
 }
 
+static s8 zram_shadow_prefetch_direction(u32 first_off, u32 cluster_off)
+{
+	if (cluster_off > first_off)
+		return 1;
+	if (cluster_off < first_off)
+		return -1;
+	return 0;
+}
+
 static unsigned long zram_shadow_prefetch_cluster_idx(
 		unsigned long cluster_base)
 {
@@ -274,13 +313,60 @@ static void zram_shadow_prefetch_record_first_touch_locked(struct zram *zram,
 	if (cluster_idx >= zram->wb->shadow_prefetch_nr_clusters ||
 	    !zram->wb->shadow_prefetch_pending ||
 	    !zram->wb->shadow_prefetch_first_off ||
-	    !zram->wb->shadow_prefetch_first_ts)
+	    !zram->wb->shadow_prefetch_first_ts ||
+	    !zram->wb->shadow_prefetch_last_off ||
+	    !zram->wb->shadow_prefetch_stride ||
+	    !zram->wb->shadow_prefetch_confidence ||
+	    !zram->wb->shadow_prefetch_direction)
 		return;
 
 	set_bit(cluster_idx, zram->wb->shadow_prefetch_pending);
 	clear_bit(cluster_idx, zram->wb->shadow_prefetch_inflight);
 	zram->wb->shadow_prefetch_first_off[cluster_idx] = cluster_off;
+	zram->wb->shadow_prefetch_last_off[cluster_idx] = cluster_off;
+	zram->wb->shadow_prefetch_stride[cluster_idx] = 0;
+	zram->wb->shadow_prefetch_confidence[cluster_idx] = 0;
+	zram->wb->shadow_prefetch_direction[cluster_idx] = 0;
 	zram->wb->shadow_prefetch_first_ts[cluster_idx] = jiffies;
+}
+
+static u32 zram_shadow_prefetch_goal_pages(u8 confidence)
+{
+	if (confidence >= 3)
+		return 8;
+
+	return ZRAM_SHADOW_PREFETCH_WINDOW_PAGES;
+}
+
+static u32 zram_shadow_prefetch_window_start(u32 cluster_off, s8 direction,
+		unsigned int nr_pages)
+{
+	if (nr_pages <= ZRAM_SHADOW_PREFETCH_WINDOW_PAGES)
+		return 0;
+
+	if (direction < 0) {
+		u32 span = min_t(u32, ZRAM_SHADOW_PREFETCH_WINDOW_PAGES, nr_pages);
+
+		if (cluster_off + 1 > span)
+			return cluster_off + 1 - span;
+		return 0;
+	}
+
+	if (cluster_off + 1 >= nr_pages)
+		return nr_pages - min_t(u32, ZRAM_SHADOW_PREFETCH_WINDOW_PAGES,
+					       nr_pages);
+
+	return cluster_off;
+}
+
+static u32 zram_shadow_prefetch_window_pages(u32 start_off,
+		unsigned int nr_pages)
+{
+	if (start_off >= nr_pages)
+		return 0;
+
+	return min_t(u32, ZRAM_SHADOW_PREFETCH_WINDOW_PAGES,
+		     nr_pages - start_off);
 }
 
 static void zram_shadow_prefetch_clear_pending_locked(struct zram *zram,
@@ -289,11 +375,19 @@ static void zram_shadow_prefetch_clear_pending_locked(struct zram *zram,
 	if (cluster_idx >= zram->wb->shadow_prefetch_nr_clusters ||
 	    !zram->wb->shadow_prefetch_pending ||
 	    !zram->wb->shadow_prefetch_first_off ||
-	    !zram->wb->shadow_prefetch_first_ts)
+	    !zram->wb->shadow_prefetch_first_ts ||
+	    !zram->wb->shadow_prefetch_last_off ||
+	    !zram->wb->shadow_prefetch_stride ||
+	    !zram->wb->shadow_prefetch_confidence ||
+	    !zram->wb->shadow_prefetch_direction)
 		return;
 
 	clear_bit(cluster_idx, zram->wb->shadow_prefetch_pending);
 	zram->wb->shadow_prefetch_first_off[cluster_idx] = 0;
+	zram->wb->shadow_prefetch_last_off[cluster_idx] = 0;
+	zram->wb->shadow_prefetch_stride[cluster_idx] = 0;
+	zram->wb->shadow_prefetch_confidence[cluster_idx] = 0;
+	zram->wb->shadow_prefetch_direction[cluster_idx] = 0;
 	zram->wb->shadow_prefetch_first_ts[cluster_idx] = 0;
 }
 
@@ -308,18 +402,30 @@ static void zram_shadow_prefetch_clear_inflight_locked(struct zram *zram,
 }
 
 static bool zram_shadow_prefetch_mark_accessed_locked(struct zram *zram,
-		unsigned long cluster_base, u32 cluster_off)
+		unsigned long cluster_base, u32 cluster_off,
+		s8 *direction, u8 *confidence)
 {
 	unsigned long cluster_idx;
 	unsigned long first_ts;
-	u8 first_off;
+	u8 last_off;
+	s8 prev_dir;
+	s8 prev_stride;
+	s8 cur_stride;
+	u8 prev_conf;
 	unsigned int diff;
 
 	if (!zram->wb->shadow_prefetch_pending ||
 	    !zram->wb->shadow_prefetch_inflight ||
 	    !zram->wb->shadow_prefetch_first_off ||
-	    !zram->wb->shadow_prefetch_first_ts)
+	    !zram->wb->shadow_prefetch_first_ts ||
+	    !zram->wb->shadow_prefetch_last_off ||
+	    !zram->wb->shadow_prefetch_stride ||
+	    !zram->wb->shadow_prefetch_confidence ||
+	    !zram->wb->shadow_prefetch_direction)
 		return false;
+
+	*direction = 0;
+	*confidence = 0;
 
 	cluster_idx = zram_shadow_prefetch_cluster_idx(cluster_base);
 	if (cluster_idx >= zram->wb->shadow_prefetch_nr_clusters)
@@ -335,8 +441,11 @@ static bool zram_shadow_prefetch_mark_accessed_locked(struct zram *zram,
 		return false;
 	}
 
-	first_off = zram->wb->shadow_prefetch_first_off[cluster_idx];
 	first_ts = zram->wb->shadow_prefetch_first_ts[cluster_idx];
+	last_off = zram->wb->shadow_prefetch_last_off[cluster_idx];
+	prev_dir = zram->wb->shadow_prefetch_direction[cluster_idx];
+	prev_stride = zram->wb->shadow_prefetch_stride[cluster_idx];
+	prev_conf = zram->wb->shadow_prefetch_confidence[cluster_idx];
 	if (!first_ts ||
 	    time_after(jiffies, first_ts + ZRAM_SHADOW_PREFETCH_PENDING_TTL)) {
 		zram_shadow_prefetch_record_first_touch_locked(zram, cluster_idx,
@@ -344,16 +453,50 @@ static bool zram_shadow_prefetch_mark_accessed_locked(struct zram *zram,
 		return false;
 	}
 
-	diff = cluster_off > first_off ? cluster_off - first_off :
-		first_off - cluster_off;
-	if (diff > 0 && diff <= ZRAM_SHADOW_PREFETCH_TRIGGER_WINDOW) {
+	diff = cluster_off > last_off ? cluster_off - last_off :
+		last_off - cluster_off;
+	if (!diff || diff > ZRAM_SHADOW_PREFETCH_TRIGGER_WINDOW) {
+		zram_shadow_prefetch_record_first_touch_locked(zram, cluster_idx,
+						      cluster_off);
+		return false;
+	}
+
+	cur_stride = cluster_off > last_off ? (s8)diff : -(s8)diff;
+	*direction = zram_shadow_prefetch_direction(last_off, cluster_off);
+	if (!*direction) {
+		zram_shadow_prefetch_record_first_touch_locked(zram, cluster_idx,
+						      cluster_off);
+		return false;
+	}
+
+	if (!prev_dir) {
+		zram->wb->shadow_prefetch_direction[cluster_idx] = *direction;
+		zram->wb->shadow_prefetch_stride[cluster_idx] = cur_stride;
+		zram->wb->shadow_prefetch_last_off[cluster_idx] = cluster_off;
+		zram->wb->shadow_prefetch_confidence[cluster_idx] = 1;
+		return false;
+	}
+
+	if (*direction != prev_dir ||
+	    abs((int)cur_stride) > ZRAM_SHADOW_PREFETCH_TRIGGER_WINDOW ||
+	    abs(abs((int)cur_stride) - abs((int)prev_stride)) > 1) {
+		zram_shadow_prefetch_record_first_touch_locked(zram, cluster_idx,
+						      cluster_off);
+		return false;
+	}
+
+	prev_conf = min_t(u8, prev_conf + 1, 3);
+	zram->wb->shadow_prefetch_direction[cluster_idx] = *direction;
+	zram->wb->shadow_prefetch_stride[cluster_idx] = cur_stride;
+	zram->wb->shadow_prefetch_last_off[cluster_idx] = cluster_off;
+	zram->wb->shadow_prefetch_confidence[cluster_idx] = prev_conf;
+	*confidence = prev_conf;
+	if (prev_conf >= 2) {
 		zram_shadow_prefetch_clear_pending_locked(zram, cluster_idx);
 		set_bit(cluster_idx, zram->wb->shadow_prefetch_inflight);
 		return true;
 	}
 
-	zram_shadow_prefetch_record_first_touch_locked(zram, cluster_idx,
-					      cluster_off);
 	return false;
 }
 
@@ -363,6 +506,14 @@ static void zram_shadow_prefetch_free_tracking(struct zram *zram)
 	zram->wb->shadow_prefetch_first_ts = NULL;
 	kvfree(zram->wb->shadow_prefetch_first_off);
 	zram->wb->shadow_prefetch_first_off = NULL;
+	kvfree(zram->wb->shadow_prefetch_last_off);
+	zram->wb->shadow_prefetch_last_off = NULL;
+	kvfree(zram->wb->shadow_prefetch_stride);
+	zram->wb->shadow_prefetch_stride = NULL;
+	kvfree(zram->wb->shadow_prefetch_confidence);
+	zram->wb->shadow_prefetch_confidence = NULL;
+	kvfree(zram->wb->shadow_prefetch_direction);
+	zram->wb->shadow_prefetch_direction = NULL;
 	kvfree(zram->wb->shadow_prefetch_pending);
 	zram->wb->shadow_prefetch_pending = NULL;
 	kvfree(zram->wb->shadow_prefetch_inflight);
@@ -377,6 +528,106 @@ static void zram_shadow_prefetch_remove_locked(
 		list_del_init(&prefetch->node);
 }
 
+static void zram_shadow_cache_update_prefetch_state_locked(struct zram *zram);
+
+static u32 zram_shadow_cache_high_wmark(struct zram *zram)
+{
+	u32 limit = READ_ONCE(zram->wb->shadow_cache_limit);
+
+	return max_t(u32, PAGE_SIZE,
+		     (u32)(((u64)limit * ZRAM_SHADOW_PREFETCH_HIGH_WMARK_PCT) / 100));
+}
+
+static u32 zram_shadow_cache_low_wmark(struct zram *zram)
+{
+	u32 limit = READ_ONCE(zram->wb->shadow_cache_limit);
+
+	return max_t(u32, PAGE_SIZE,
+		     (u32)(((u64)limit * ZRAM_SHADOW_PREFETCH_LOW_WMARK_PCT) / 100));
+}
+
+static unsigned long zram_shadow_cache_prefetch_cooldown(struct zram *zram)
+{
+	unsigned long cooldown = ZRAM_SHADOW_PREFETCH_COOLDOWN;
+
+	if (READ_ONCE(zram->wb->shadow_last_hit_rate) < 10)
+		cooldown *= 2;
+
+	return cooldown;
+}
+
+static u32 zram_shadow_cache_limit_for_clusters(unsigned int nr_clusters)
+{
+	return ZRAM_WB_CLUSTER_SIZE * PAGE_SIZE * nr_clusters;
+}
+
+static void zram_shadow_cache_note_access(struct zram *zram, bool hit)
+{
+	if (zram->wb->shadow_access_window >= ZRAM_SHADOW_HIT_WINDOW) {
+		zram->wb->shadow_access_window = max_t(u32, 1,
+						      zram->wb->shadow_access_window >> 1);
+		zram->wb->shadow_hits_window >>= 1;
+	}
+
+	zram->wb->shadow_access_window++;
+	if (hit)
+		zram->wb->shadow_hits_window++;
+
+	zram->wb->shadow_last_hit_rate =
+		(zram->wb->shadow_hits_window * 100) /
+		max_t(unsigned int, 1, zram->wb->shadow_access_window);
+}
+
+static enum zram_shadow_prefetch_gate
+zram_shadow_cache_prefetch_gate(struct zram *zram)
+{
+	unsigned long flags;
+	enum zram_shadow_prefetch_gate gate =
+		ZRAM_SHADOW_PREFETCH_GATE_ALLOWED;
+
+	spin_lock_irqsave(&zram->wb->shadow_lock, flags);
+	zram_shadow_cache_update_prefetch_state_locked(zram);
+	if (zram->wb->prefetch_hwm_blocked)
+		gate = ZRAM_SHADOW_PREFETCH_GATE_BLOCKED_HWM;
+	else if (time_before(jiffies, zram->wb->prefetch_cooldown_until))
+		gate = ZRAM_SHADOW_PREFETCH_GATE_BLOCKED_COOLDOWN;
+	spin_unlock_irqrestore(&zram->wb->shadow_lock, flags);
+
+	return gate;
+}
+
+static void zram_shadow_cache_record_prefetch_block(struct zram *zram,
+		enum zram_shadow_prefetch_gate gate)
+{
+	if (gate == ZRAM_SHADOW_PREFETCH_GATE_ALLOWED)
+		return;
+
+	atomic64_inc(&zram->stats.prefetch_blocked);
+	if (gate == ZRAM_SHADOW_PREFETCH_GATE_BLOCKED_COOLDOWN)
+		atomic64_inc(&zram->stats.prefetch_cooldown);
+}
+
+static void zram_shadow_cache_update_prefetch_state_locked(struct zram *zram)
+{
+	u32 high_wmark = zram_shadow_cache_high_wmark(zram);
+	u32 low_wmark = zram_shadow_cache_low_wmark(zram);
+
+	if (zram->wb->shadow_cache_bytes >= high_wmark)
+		zram->wb->prefetch_hwm_blocked = true;
+	else if (zram->wb->prefetch_hwm_blocked &&
+		 zram->wb->shadow_cache_bytes <= low_wmark)
+		zram->wb->prefetch_hwm_blocked = false;
+}
+
+static void zram_shadow_cache_start_prefetch_cooldown_locked(struct zram *zram,
+		unsigned long cooldown)
+{
+	unsigned long until = jiffies + cooldown;
+
+	if (time_before(zram->wb->prefetch_cooldown_until, until))
+		zram->wb->prefetch_cooldown_until = until;
+}
+
 static void zram_shadow_cache_remove_locked(struct zram *zram,
 		struct zram_shadow_cache *cache)
 {
@@ -388,52 +639,26 @@ static void zram_shadow_cache_remove_locked(struct zram *zram,
 		zram->wb->shadow_cache_bytes -= cache->bytes;
 	else
 		zram->wb->shadow_cache_bytes = 0;
+	zram_shadow_cache_update_prefetch_state_locked(zram);
 }
 
 static void zram_shadow_cache_timer(struct timer_list *timer)
 {
 	struct zram_shadow_cache *cache = from_timer(cache, timer, timer);
 	struct zram *zram = cache->zram;
-	unsigned long cluster_base = cache->cluster_base;
 	unsigned long flags;
-	unsigned long bitmap_flags;
-	unsigned int i;
 
 	spin_lock_irqsave(&zram->wb->shadow_lock, flags);
 	zram_shadow_cache_remove_locked(zram, cache);
 	spin_unlock_irqrestore(&zram->wb->shadow_lock, flags);
 
-	for (i = 0; i < cache->nr_pages; i++) {
-		u32 index;
-
-		if (!test_bit(i, &cache->state_bitmap))
-			continue;
-		if (!cache->indexes)
-			continue;
-		index = cache->indexes[i];
-		if (index == U32_MAX)
-			continue;
-
-		zram_slot_lock(zram, index);
-		if (zram_test_flag(zram, index, ZRAM_WB) &&
-		    zram_get_wb_cluster_base(zram, index) == cluster_base &&
-		    zram_get_wb_cluster_off(zram, index) == i) {
-			spin_lock_irqsave(&zram->wb->bitmap_lock, bitmap_flags);
-			if (!test_and_clear_bit(cluster_base + i, zram->wb->bitmap))
-				WARN_ON_ONCE(1);
-			set_bit(cluster_base + i, zram->wb->dirty_free_bitmap);
-			spin_unlock_irqrestore(&zram->wb->bitmap_lock, bitmap_flags);
-			zram_clear_flag(zram, index, ZRAM_WB);
-			zram_set_handle(zram, index, 0);
-			zram->table[index].wb_nr_pages = 0;
-			zram->table[index].migration_count = 0;
-			zram->table[index].memcg_id = 0;
-			percpu_counter_dec(&zram->stats.bd_count);
-			percpu_counter_dec(&zram->stats.pages_stored);
-		}
-		zram_slot_unlock(zram, index);
-	}
-
+	if (!cache->hit_count)
+		atomic64_inc(&zram->stats.prefetch_zero_hits);
+	else if (cache->hit_count == 1)
+		atomic64_inc(&zram->stats.prefetch_single_hits);
+	else
+		atomic64_inc(&zram->stats.prefetch_multi_hits);
+	atomic64_inc(&zram->stats.prefetch_expired);
 	zram_shadow_cache_free(cache);
 }
 
@@ -458,15 +683,20 @@ static void zram_shadow_cache_populate_indexes(struct zram *zram,
 		struct zram_shadow_cache *cache)
 {
 	unsigned long index;
+	u32 cluster_off;
 
 	for (index = 0; index < zram->disksize >> PAGE_SHIFT; index++) {
 		if (!zram_test_flag(zram, index, ZRAM_WB))
 			continue;
 		if (zram_get_wb_cluster_base(zram, index) != cache->cluster_base)
 			continue;
-		if (zram_get_wb_cluster_off(zram, index) >= cache->nr_pages)
+		cluster_off = zram_get_wb_cluster_off(zram, index);
+		if (cluster_off < cache->start_off)
 			continue;
-		cache->indexes[zram_get_wb_cluster_off(zram, index)] = index;
+		cluster_off -= cache->start_off;
+		if (cluster_off >= cache->nr_pages)
+			continue;
+		cache->indexes[cluster_off] = index;
 	}
 }
 
@@ -475,29 +705,38 @@ static int zram_shadow_cache_copy(struct zram *zram, struct page *page,
 {
 	struct zram_shadow_cache *cache;
 	unsigned long flags;
+	u32 local_off;
+	bool hit = false;
 	int ret = -ENOENT;
 
 	spin_lock_irqsave(&zram->wb->shadow_lock, flags);
 	cache = zram_shadow_cache_find_locked(zram, cluster_base);
-		if (cache && cluster_off < cache->nr_pages && cache->pages &&
-		    cache->pages[cluster_off]) {
-		copy_highpage(page, cache->pages[cluster_off]);
-		set_bit(cluster_off, &cache->state_bitmap);
+	if (cache && cluster_off >= cache->start_off)
+		local_off = cluster_off - cache->start_off;
+	else
+		local_off = U32_MAX;
+	if (cache && local_off < cache->nr_pages && cache->pages &&
+	    cache->pages[local_off]) {
+		copy_highpage(page, cache->pages[local_off]);
 		cache->expires_at = jiffies + cache->ttl_jiffies;
 		mod_timer(&cache->timer, cache->expires_at);
+		cache->hit_count++;
+		hit = true;
 		ret = 0;
 	}
 	spin_unlock_irqrestore(&zram->wb->shadow_lock, flags);
 
+	atomic64_inc(&zram->stats.prefetch_accesses);
+	zram_shadow_cache_note_access(zram, hit);
+
 	if (!ret) {
+		/*
+		 * Shadow cache is only a transient mirror of backing-store data.
+		 * A cache hit must not transfer ownership away from the writeback
+		 * entry; expiration of the cache is therefore allowed to free only
+		 * the temporary pages kept here.
+		 */
 		atomic64_inc(&zram->stats.prefetch_hits);
-		if (zram->wb->shadow_access_window < ZRAM_SHADOW_HIT_WINDOW)
-			zram->wb->shadow_access_window++;
-		if (zram->wb->shadow_hits_window < ZRAM_SHADOW_HIT_WINDOW)
-			zram->wb->shadow_hits_window++;
-		zram->wb->shadow_last_hit_rate =
-			(zram->wb->shadow_hits_window * 100) /
-			max_t(unsigned int, 1, zram->wb->shadow_access_window);
 		zram_slot_lock(zram, index);
 		zram_accessed(zram, index);
 		zram_slot_unlock(zram, index);
@@ -507,12 +746,14 @@ static int zram_shadow_cache_copy(struct zram *zram, struct page *page,
 }
 
 static int zram_shadow_cache_prefetch(struct zram *zram,
-		unsigned long cluster_base, unsigned int nr_pages)
+		unsigned long cluster_base, u32 start_off, unsigned int nr_pages)
 {
 	struct zram_shadow_cache *cache;
 	unsigned long flags;
 	unsigned int i;
+	unsigned int cached_pages = 0;
 	gfp_t gfp = GFP_NOIO | __GFP_NOWARN;
+	bool evicted = false;
 	int ret;
 
 	cache = kzalloc(sizeof(*cache), gfp);
@@ -524,7 +765,12 @@ static int zram_shadow_cache_prefetch(struct zram *zram,
 	cache->zram = zram;
 	cache->cluster_base = cluster_base;
 	cache->ttl_jiffies = zram->wb->shadow_ttl_jiffies;
+	cache->start_off = start_off;
 	cache->nr_pages = nr_pages;
+	cache->max_pages = nr_pages;
+	cache->hit_count = 0;
+	cache->confidence = 0;
+	cache->direction = 0;
 	cache->pages = kcalloc(nr_pages, sizeof(*cache->pages), gfp);
 	if (!cache->pages) {
 		ret = -ENOMEM;
@@ -546,7 +792,8 @@ static int zram_shadow_cache_prefetch(struct zram *zram,
 		}
 	}
 
-	ret = zram_read_wb_pages_sync(zram, cache->pages, cluster_base, nr_pages);
+	ret = zram_read_wb_pages_sync(zram, cache->pages,
+				     cluster_base + start_off, nr_pages);
 	if (ret)
 		goto err_free;
 	zram_shadow_cache_populate_indexes(zram, cache);
@@ -558,8 +805,10 @@ static int zram_shadow_cache_prefetch(struct zram *zram,
 	}
 	cache->bytes = 0;
 	for (i = 0; i < nr_pages; i++) {
-		if (cache->pages[i])
+		if (cache->pages[i]) {
 			cache->bytes += PAGE_SIZE;
+			cached_pages++;
+		}
 	}
 	if (!cache->bytes) {
 		ret = -ENOENT;
@@ -577,10 +826,13 @@ static int zram_shadow_cache_prefetch(struct zram *zram,
 	cache->expires_at = jiffies + cache->ttl_jiffies;
 	mod_timer(&cache->timer, cache->expires_at);
 	atomic64_inc(&zram->stats.prefetch_total);
+	atomic64_add(cached_pages, &zram->stats.prefetched_pages);
 	while (zram->wb->shadow_cache_bytes > zram->wb->shadow_cache_limit &&
 	       !list_empty(&zram->wb->shadow_caches)) {
 		struct zram_shadow_cache *oldest;
 
+		evicted = true;
+		atomic64_inc(&zram->stats.prefetch_evicted);
 		oldest = zram_shadow_cache_detach_oldest_locked(zram);
 		spin_unlock_irqrestore(&zram->wb->shadow_lock, flags);
 		if (!oldest)
@@ -589,6 +841,10 @@ static int zram_shadow_cache_prefetch(struct zram *zram,
 		zram_shadow_cache_free(oldest);
 		spin_lock_irqsave(&zram->wb->shadow_lock, flags);
 	}
+	if (evicted)
+		zram_shadow_cache_start_prefetch_cooldown_locked(zram,
+						 zram_shadow_cache_prefetch_cooldown(zram));
+	zram_shadow_cache_update_prefetch_state_locked(zram);
 	spin_unlock_irqrestore(&zram->wb->shadow_lock, flags);
 
 	return 0;
@@ -603,15 +859,21 @@ static void zram_shadow_cache_prefetch_work(struct work_struct *work)
 	struct zram_shadow_prefetch *prefetch =
 		container_of(work, struct zram_shadow_prefetch, work);
 	struct zram *zram = prefetch->zram;
+	enum zram_shadow_prefetch_gate gate;
 	unsigned long cluster_idx;
 	unsigned long flags;
 
 	cluster_idx = zram_shadow_prefetch_cluster_idx(prefetch->cluster_base);
+	gate = zram_shadow_cache_prefetch_gate(zram);
 
 	if (!READ_ONCE(zram->wb->prefetch_disabled) &&
+	    gate == ZRAM_SHADOW_PREFETCH_GATE_ALLOWED &&
 	    READ_ONCE(zram->wb->backing_dev) && READ_ONCE(zram->wb->bdev))
 		zram_shadow_cache_prefetch(zram, prefetch->cluster_base,
+					   prefetch->start_off,
 					   prefetch->nr_pages);
+	else if (!READ_ONCE(zram->wb->prefetch_disabled))
+		zram_shadow_cache_record_prefetch_block(zram, gate);
 
 	spin_lock_irqsave(&zram->wb->shadow_lock, flags);
 	zram_shadow_prefetch_clear_inflight_locked(zram, cluster_idx);
@@ -626,21 +888,45 @@ static void zram_shadow_cache_schedule_prefetch(struct zram *zram,
 		unsigned int nr_pages)
 {
 	struct zram_shadow_prefetch *prefetch;
+	enum zram_shadow_prefetch_gate gate;
 	unsigned long cluster_idx;
 	unsigned long flags;
 	bool should_queue;
+	s8 direction;
+	u8 confidence;
+	u32 start_off;
+	u32 window_pages;
 
 	if (nr_pages <= 1 || READ_ONCE(zram->wb->prefetch_disabled) ||
 	    !READ_ONCE(zram->wb->backing_dev) || !READ_ONCE(zram->wb->bdev) ||
 	    !READ_ONCE(zram->wb->prefetch_wq))
 		return;
+	gate = zram_shadow_cache_prefetch_gate(zram);
+	if (gate != ZRAM_SHADOW_PREFETCH_GATE_ALLOWED) {
+		zram_shadow_cache_record_prefetch_block(zram, gate);
+		return;
+	}
 
 	spin_lock_irqsave(&zram->wb->shadow_lock, flags);
+	cluster_idx = zram_shadow_prefetch_cluster_idx(cluster_base);
 	should_queue = zram_shadow_prefetch_mark_accessed_locked(zram,
 						 cluster_base,
-						 cluster_off);
+						 cluster_off,
+						 &direction,
+						 &confidence);
 	spin_unlock_irqrestore(&zram->wb->shadow_lock, flags);
 	if (!should_queue)
+		return;
+
+	if (!direction)
+		return;
+	start_off = zram_shadow_prefetch_window_start(cluster_off, direction,
+					       nr_pages);
+	window_pages = min_t(u32,
+				     zram_shadow_prefetch_goal_pages(confidence),
+				     zram_shadow_prefetch_window_pages(start_off,
+							      nr_pages));
+	if (!window_pages)
 		return;
 
 	prefetch = kzalloc(sizeof(*prefetch), GFP_NOWAIT | __GFP_NOWARN);
@@ -658,7 +944,9 @@ static void zram_shadow_cache_schedule_prefetch(struct zram *zram,
 	prefetch->zram = zram;
 	prefetch->cluster_base = cluster_base;
 	prefetch->cluster_off = cluster_off;
-	prefetch->nr_pages = nr_pages;
+	prefetch->start_off = start_off;
+	prefetch->nr_pages = window_pages;
+	prefetch->direction = direction;
 
 	spin_lock_irqsave(&zram->wb->shadow_lock, flags);
 	if (WARN_ON_ONCE(zram_shadow_prefetch_find_locked(zram, cluster_base))) {
@@ -737,9 +1025,10 @@ static void zram_shadow_cache_purge_expiring(struct zram *zram,
 		cache = NULL;
 		found = false;
 		list_for_each_entry(cache, &zram->wb->shadow_caches, node) {
-			if (time_before_eq(cache->expires_at,
+		if (time_before_eq(cache->expires_at,
 					   jiffies + max_remaining)) {
 				zram_shadow_cache_remove_locked(zram, cache);
+				atomic64_inc(&zram->stats.prefetch_expired);
 				found = true;
 				break;
 			}
@@ -1077,6 +1366,12 @@ static bool place_pp_slot(struct zram *zram, struct zram_pp_ctl *ctl,
 	struct zram_pp_slot *pps;
 	u32 bid;
 	u16 memcg_id;
+
+	/* Caller must hold the slot lock so state stays stable while we snapshot. */
+	if (!zram_allocated(zram, index) ||
+	    zram_test_flag(zram, index, ZRAM_WB) ||
+	    zram_test_flag(zram, index, ZRAM_SAME))
+		return false;
 
 	pps = kmalloc(sizeof(*pps), GFP_NOIO | __GFP_NOWARN);
 	if (!pps)
@@ -1607,6 +1902,10 @@ static ssize_t backing_dev_store(struct device *dev,
 	unsigned long *prefetch_pending = NULL, *prefetch_inflight = NULL;
 	unsigned long *prefetch_first_ts = NULL;
 	u8 *prefetch_first_off = NULL;
+	u8 *prefetch_last_off = NULL;
+	s8 *prefetch_stride = NULL;
+	u8 *prefetch_confidence = NULL;
+	s8 *prefetch_direction = NULL;
 	struct block_device *bdev = NULL;
 	int err;
 	struct zram *zram = dev_to_zram(dev);
@@ -1696,6 +1995,34 @@ static ssize_t backing_dev_store(struct device *dev,
 		err = -ENOMEM;
 		goto out;
 	}
+	prefetch_last_off = kvmalloc_array(nr_clusters,
+					sizeof(*prefetch_last_off),
+					GFP_KERNEL | __GFP_ZERO);
+	if (!prefetch_last_off) {
+		err = -ENOMEM;
+		goto out;
+	}
+	prefetch_stride = kvmalloc_array(nr_clusters,
+					sizeof(*prefetch_stride),
+					GFP_KERNEL | __GFP_ZERO);
+	if (!prefetch_stride) {
+		err = -ENOMEM;
+		goto out;
+	}
+	prefetch_confidence = kvmalloc_array(nr_clusters,
+					sizeof(*prefetch_confidence),
+					GFP_KERNEL | __GFP_ZERO);
+	if (!prefetch_confidence) {
+		err = -ENOMEM;
+		goto out;
+	}
+	prefetch_direction = kvmalloc_array(nr_clusters,
+					sizeof(*prefetch_direction),
+					GFP_KERNEL | __GFP_ZERO);
+	if (!prefetch_direction) {
+		err = -ENOMEM;
+		goto out;
+	}
 
 	reset_bdev(zram);
 
@@ -1707,6 +2034,10 @@ static ssize_t backing_dev_store(struct device *dev,
 	zram->wb->shadow_prefetch_inflight = prefetch_inflight;
 	zram->wb->shadow_prefetch_first_ts = prefetch_first_ts;
 	zram->wb->shadow_prefetch_first_off = prefetch_first_off;
+	zram->wb->shadow_prefetch_last_off = prefetch_last_off;
+	zram->wb->shadow_prefetch_stride = prefetch_stride;
+	zram->wb->shadow_prefetch_confidence = prefetch_confidence;
+	zram->wb->shadow_prefetch_direction = prefetch_direction;
 	zram->wb->shadow_prefetch_nr_clusters = nr_clusters;
 	zram->wb->nr_pages = nr_pages;
 	up_write(&zram->init_lock);
@@ -1716,6 +2047,10 @@ static ssize_t backing_dev_store(struct device *dev,
 
 	return len;
 out:
+	kvfree(prefetch_direction);
+	kvfree(prefetch_confidence);
+	kvfree(prefetch_stride);
+	kvfree(prefetch_last_off);
 	kvfree(prefetch_first_off);
 	kvfree(prefetch_first_ts);
 	kvfree(prefetch_inflight);
@@ -1879,7 +2214,10 @@ static int zram_writeback_slots(struct zram *zram, struct zram_pp_ctl *ctl)
 
 		/* --- 5. 读取 ZRAM 数据 --- */
 		zram_slot_lock(zram, index);
-		if (!zram_test_flag(zram, index, ZRAM_PP_SLOT)) {
+		if (!zram_test_flag(zram, index, ZRAM_PP_SLOT) ||
+		    !zram_allocated(zram, index) ||
+		    zram_test_flag(zram, index, ZRAM_WB) ||
+		    zram_test_flag(zram, index, ZRAM_SAME)) {
 			zram_slot_unlock(zram, index);
 			__free_page(page);
 			free_pp_slot(zram, pps);
@@ -2224,15 +2562,22 @@ int zram_read_wb_page_sync(struct zram *zram, struct page *page,
 			   unsigned long entry)
 {
 	struct zram_work work;
+	ktime_t start;
+	u64 latency_ns;
 
 	work.page = page;
 	work.zram = zram;
 	work.entry = entry;
 
+	start = ktime_get();
 	INIT_WORK_ONSTACK(&work.work, zram_sync_read);
 	queue_work(system_unbound_wq, &work.work);
 	flush_work(&work.work);
 	destroy_work_on_stack(&work.work);
+	latency_ns = ktime_to_ns(ktime_sub(ktime_get(), start));
+
+	if (unlikely(latency_ns >= ZRAM_WB_SLOW_READ_THRESHOLD_MS * NSEC_PER_MSEC))
+		zram_wb_record_slow_read(zram, entry, latency_ns);
 
 	return work.error;
 }
@@ -2617,6 +2962,26 @@ static ssize_t prefetch_stat_show(struct device *dev,
 	ret = scnprintf(buf, PAGE_SIZE, "%8llu %8llu\n",
 			(u64)atomic64_read(&zram->stats.prefetch_total),
 			(u64)atomic64_read(&zram->stats.prefetch_hits));
+	{
+		u64 accesses = (u64)atomic64_read(&zram->stats.prefetch_accesses);
+		u64 hits = (u64)atomic64_read(&zram->stats.prefetch_hits);
+		u64 hit_rate = hits * 100 / max_t(u64, 1, accesses);
+
+		ret = scnprintf(buf, PAGE_SIZE,
+			"%8llu %8llu %8llu %8llu %8llu %8llu %8llu %8llu %8llu %8llu %8llu %8llu\n",
+			(u64)atomic64_read(&zram->stats.prefetch_total),
+			hits,
+			accesses,
+			(u64)atomic64_read(&zram->stats.prefetched_pages),
+			(u64)atomic64_read(&zram->stats.prefetch_evicted),
+			(u64)atomic64_read(&zram->stats.prefetch_expired),
+			(u64)atomic64_read(&zram->stats.prefetch_blocked),
+			(u64)atomic64_read(&zram->stats.prefetch_cooldown),
+			(u64)atomic64_read(&zram->stats.prefetch_zero_hits),
+			(u64)atomic64_read(&zram->stats.prefetch_single_hits),
+			(u64)atomic64_read(&zram->stats.prefetch_multi_hits),
+			hit_rate);
+	}
 	up_read(&zram->init_lock);
 
 	return ret;
@@ -2662,11 +3027,9 @@ static void zram_meta_free(struct zram *zram, u64 disksize)
 		zram_free_page(zram, index);
 
 	zs_destroy_pool(zram->mem_pool);
+	zram->mem_pool = NULL;
 	
 	synchronize_rcu();
-
-	/* Destroy the per-device idle LRU */
-	list_lru_destroy(&zram->wb->zram_list_lru);
 	
 	vfree(zram->table);
 	zram->table = NULL;
@@ -2695,10 +3058,6 @@ static bool zram_meta_alloc(struct zram *zram, u64 disksize)
 
 	if (!huge_class_size)
 		huge_class_size = zs_huge_class_size(zram->mem_pool);
-	
-	/* Initialize the per-device idle LRU */
-	if (list_lru_init(&zram->wb->zram_list_lru))
-		return false;
 	
 	return true;
 }
@@ -2735,7 +3094,10 @@ void zram_free_page(struct zram *zram, size_t index)
 
 	if (zram_test_flag(zram, index, ZRAM_WB)) {
 		zram_clear_flag(zram, index, ZRAM_WB);
-		free_block_bdev(zram, zram_get_wb_blk_idx(zram, index));
+		if (zram->wb && zram->wb->bitmap)
+			free_block_bdev(zram, zram_get_wb_blk_idx(zram, index));
+		else
+			percpu_counter_dec(&zram->stats.bd_count);
 		goto out;
 	}
 
@@ -3125,7 +3487,19 @@ static int zram_bvec_write_partial(struct zram *zram, struct bio_vec *bvec,
 	if (!page)
 		return -ENOMEM;
 
-	ret = zram_read_page(zram, page, index, bio);
+	/*
+	 * Partial write must first obtain the old full-page contents before the
+	 * caller patches the modified byte range into the temporary page.
+	 *
+	 * Passing @bio here may route writeback-backed slots through
+	 * read_from_bdev_async(), which returns before the page data is actually
+	 * available. That can corrupt the reconstructed page and later re-store a
+	 * partially uninitialized page into zram, showing up as random app crashes
+	 * or segfaults after long uptimes.
+	 *
+	 * Force a synchronous read for this read-modify-write path.
+	 */
+	ret = zram_read_page(zram, page, index, NULL);
 	if (!ret) {
 		memcpy_from_bvec(page_address(page) + offset, bvec);
 		ret = zram_write_page(zram, page, index);
@@ -3658,6 +4032,7 @@ static void zram_reset_device(struct zram *zram)
 
 	set_capacity_and_notify(zram->disk, 0);
 	part_stat_set_all(zram->disk->part0, 0);
+	reset_bdev(zram);
 
 	/* I/O operation under all of CPU are done so let's free */
 	zram_meta_free(zram, zram->disksize);
@@ -3666,7 +4041,6 @@ static void zram_reset_device(struct zram *zram)
 	zram_stats_destroy(zram);
 	WARN_ON(zram_stats_init(zram));
 	atomic_set(&zram->pp_in_progress, 0);
-	reset_bdev(zram);
 
 	comp_algorithm_set(zram, ZRAM_PRIMARY_COMP, default_compressor);
 	up_write(&zram->init_lock);
@@ -4136,16 +4510,28 @@ static int zram_add(void)
 	zram->wb->stop_writeback = false;
 	zram->wb->last_monitored_bd_reads = 0;
 	zram->wb->last_monitored_bd_writes = 0;
+	zram->wb->last_monitored_prefetch_total = 0;
+	zram->wb->last_monitored_prefetch_hits = 0;
+	zram->wb->last_monitored_prefetch_accesses = 0;
+	zram->wb->last_monitored_prefetch_expired = 0;
+	zram->wb->last_monitored_prefetch_blocked = 0;
 	zram->wb->reclaim_threshold = 4;
 	zram->wb->shadow_cache_bytes = 0;
-	zram->wb->shadow_cache_limit = ZRAM_WB_CLUSTER_SIZE * PAGE_SIZE * 8;
+	zram->wb->shadow_cache_limit =
+		zram_shadow_cache_limit_for_clusters(
+			ZRAM_SHADOW_CACHE_DEFAULT_CLUSTERS);
 	zram->wb->shadow_cache_next_age = 1;
 	zram->wb->shadow_ttl_jiffies = ZRAM_SHADOW_CACHE_TTL;
 	zram->wb->shadow_hits_window = 0;
 	zram->wb->shadow_access_window = 0;
 	zram->wb->shadow_last_hit_rate = 0;
 	zram->wb->gc_scan_cursor = 0;
+	zram->wb->prefetch_cooldown_until = 0;
+	zram->wb->slowpath_until = 0;
+	zram->wb->slow_read_lat_max_ns = 0;
+	zram->wb->slow_gc_lat_max_ns = 0;
 	zram->wb->prefetch_disabled = false;
+	zram->wb->prefetch_hwm_blocked = false;
 	zram->wb->emergency_reclaim = false;
 	zram->wb->idle_skip_interval = 30;
 #endif
@@ -4222,11 +4608,13 @@ static int zram_add(void)
 	zram->disksize = default_disksize;
 	set_capacity_and_notify(zram->disk, zram->disksize >> SECTOR_SHIFT);
 	#ifdef CONFIG_ZRAM_WRITEBACK
-	zram_init_shrinker(zram);
-	if (!zram->wb->zram_shrinker)
-		goto out_cleanup_disk;
 	if (list_lru_init(&zram->wb->zram_list_lru))
+		goto out_cleanup_disk;
+	zram_init_shrinker(zram);
+	if (!zram->wb->zram_shrinker) {
+		ret = -ENOMEM;
 		goto lru_fail;
+	}
 	#endif /* CONFIG_ZRAM_WRITEBACK */
 	up_write(&zram->init_lock);
 
@@ -4260,16 +4648,25 @@ static int zram_add(void)
 	blk_queue_flag_set(QUEUE_FLAG_STABLE_WRITES, zram->disk->queue);
 	ret = device_add_disk(NULL, zram->disk, zram_disk_groups);
 	if (ret)
-		goto out_cleanup_disk;
+		goto shrinker_fail;
 	queue_delayed_work(system_unbound_wq, &zram->wb->gc_periodic_work,
 				 ZRAM_GC_PERIODIC_INTERVAL);
 
 	zram_debugfs_register(zram);
 	pr_info("Added device: %s with default size %llu bytes\n", zram->disk->disk_name, default_disksize);
 	return device_id;
+
+	#ifdef CONFIG_ZRAM_WRITEBACK
+shrinker_fail:
+	if (zram->wb->zram_shrinker) {
+		unregister_shrinker(zram->wb->zram_shrinker);
+		shrinker_free(zram->wb->zram_shrinker);
+		zram->wb->zram_shrinker = NULL;
+	}
 lru_fail:
-	unregister_shrinker(zram->wb->zram_shrinker);
-	shrinker_free(zram->wb->zram_shrinker);
+	if (zram->wb->zram_list_lru.node)
+		list_lru_destroy(&zram->wb->zram_list_lru);
+	#endif
 out_cleanup_disk:
 	#ifdef CONFIG_ZRAM_WRITEBACK
 	if (zram->wb && zram->wb->prefetch_wq) {
@@ -4338,13 +4735,15 @@ static int zram_remove(struct zram *zram)
 	if (zram->wb->zram_shrinker) {
         unregister_shrinker(zram->wb->zram_shrinker);
         shrinker_free(zram->wb->zram_shrinker);
+		zram->wb->zram_shrinker = NULL;
     }
 	if (zram->wb->prefetch_wq) {
 		destroy_workqueue(zram->wb->prefetch_wq);
 		zram->wb->prefetch_wq = NULL;
 	}
 	synchronize_rcu();
-    list_lru_destroy(&zram->wb->zram_list_lru);
+	if (zram->wb->zram_list_lru.node)
+		list_lru_destroy(&zram->wb->zram_list_lru);
 	#endif
 
 	put_disk(zram->disk);
@@ -4546,8 +4945,23 @@ static int monitor_func(void *data)
 			unsigned long zram_usage = get_zram_usage(zram);
 			u64 bd_reads = 0;
 			u64 bd_writes = 0;
+			u64 prefetch_total = 0;
+			u64 prefetch_hits = 0;
+			u64 prefetch_accesses = 0;
+			u64 prefetch_expired = 0;
+			u64 prefetch_blocked = 0;
 			u64 delta_reads = 0;
 			u64 delta_writes = 0;
+			u64 delta_prefetch_total = 0;
+			u64 delta_prefetch_hits = 0;
+			u64 delta_prefetch_accesses = 0;
+			u64 delta_prefetch_expired = 0;
+			u64 delta_prefetch_blocked = 0;
+			u64 recent_hit_rate = 0;
+			u64 blocked_window = 0;
+			u64 blocked_pct = 0;
+			unsigned int target_clusters =
+				ZRAM_SHADOW_CACHE_DEFAULT_CLUSTERS;
 			bool stop_writeback = false;
 			total_zram_usage += zram_usage;
 			zram_count++;
@@ -4560,29 +4974,87 @@ static int monitor_func(void *data)
 			if (init_done(zram) && zram->wb->backing_dev) {
 				bd_reads = zram_stat_read(&zram->stats.bd_reads);
 				bd_writes = zram_stat_read(&zram->stats.bd_writes);
+				prefetch_total =
+					(u64)atomic64_read(&zram->stats.prefetch_total);
+				prefetch_hits =
+					(u64)atomic64_read(&zram->stats.prefetch_hits);
+				prefetch_accesses =
+					(u64)atomic64_read(&zram->stats.prefetch_accesses);
+				prefetch_expired =
+					(u64)atomic64_read(&zram->stats.prefetch_expired);
+				prefetch_blocked =
+					(u64)atomic64_read(&zram->stats.prefetch_blocked);
 				delta_reads = bd_reads - zram->wb->last_monitored_bd_reads;
 				delta_writes = bd_writes - zram->wb->last_monitored_bd_writes;
+				delta_prefetch_total = prefetch_total -
+					zram->wb->last_monitored_prefetch_total;
+				delta_prefetch_hits = prefetch_hits -
+					zram->wb->last_monitored_prefetch_hits;
+				delta_prefetch_accesses = prefetch_accesses -
+					zram->wb->last_monitored_prefetch_accesses;
+				delta_prefetch_expired = prefetch_expired -
+					zram->wb->last_monitored_prefetch_expired;
+				delta_prefetch_blocked = prefetch_blocked -
+					zram->wb->last_monitored_prefetch_blocked;
 				zram->wb->last_monitored_bd_reads = bd_reads;
 				zram->wb->last_monitored_bd_writes = bd_writes;
+				zram->wb->last_monitored_prefetch_total = prefetch_total;
+				zram->wb->last_monitored_prefetch_hits = prefetch_hits;
+				zram->wb->last_monitored_prefetch_accesses =
+					prefetch_accesses;
+				zram->wb->last_monitored_prefetch_expired = prefetch_expired;
+				zram->wb->last_monitored_prefetch_blocked = prefetch_blocked;
+				if (delta_prefetch_accesses)
+					recent_hit_rate = div64_u64(delta_prefetch_hits * 100,
+								    delta_prefetch_accesses);
+				else
+					recent_hit_rate =
+						READ_ONCE(zram->wb->shadow_last_hit_rate);
+				blocked_window = delta_prefetch_total + delta_prefetch_blocked;
+				if (blocked_window)
+					blocked_pct = div64_u64(delta_prefetch_blocked * 100,
+							       blocked_window);
 				zram->wb->prefetch_disabled = mem_usage >= MEM_THRESHOLD;
 				zram->wb->emergency_reclaim = mem_usage >= MEM_THRESHOLD + 5;
 				if (zram->wb->emergency_reclaim) {
 					zram->wb->shadow_ttl_jiffies = ZRAM_SHADOW_CACHE_TTL_MIN;
-					zram->wb->shadow_cache_limit = ZRAM_WB_CLUSTER_SIZE * PAGE_SIZE * 2;
+					zram->wb->shadow_cache_limit =
+						zram_shadow_cache_limit_for_clusters(
+							ZRAM_SHADOW_CACHE_EMERGENCY_CLUSTERS);
 					zram->wb->idle_skip_interval = 10;
 					zram_shadow_cache_purge_expiring(zram, HZ);
 				} else {
-					if (zram->wb->shadow_last_hit_rate > 50)
-						zram->wb->shadow_ttl_jiffies = min_t(unsigned long,
-							zram->wb->shadow_ttl_jiffies +
-							ZRAM_SHADOW_CACHE_TTL_GROW_STEP,
-							ZRAM_SHADOW_CACHE_TTL_MAX);
-					else if (zram->wb->shadow_last_hit_rate < 10)
+					if (blocked_pct >=
+					    ZRAM_SHADOW_PREFETCH_BLOCKED_LIMIT_BOOST_PCT &&
+					    mem_usage + 5 < MEM_THRESHOLD)
+						target_clusters =
+							ZRAM_SHADOW_CACHE_BOOST_CLUSTERS;
+
+					if (blocked_pct >=
+					    ZRAM_SHADOW_PREFETCH_BLOCKED_TTL_SHRINK_PCT &&
+					    delta_prefetch_total > 0 &&
+					    delta_prefetch_expired >= delta_prefetch_total &&
+					    recent_hit_rate <
+					    ZRAM_SHADOW_PREFETCH_MIN_HIT_RATE_PCT)
 						zram->wb->shadow_ttl_jiffies = max_t(unsigned long,
 							zram->wb->shadow_ttl_jiffies -
 							ZRAM_SHADOW_CACHE_TTL_SHRINK_STEP,
 							ZRAM_SHADOW_CACHE_TTL_MIN);
-					zram->wb->shadow_cache_limit = ZRAM_WB_CLUSTER_SIZE * PAGE_SIZE * 8;
+					else if (recent_hit_rate > 50)
+						zram->wb->shadow_ttl_jiffies = min_t(unsigned long,
+							zram->wb->shadow_ttl_jiffies +
+							ZRAM_SHADOW_CACHE_TTL_GROW_STEP,
+							ZRAM_SHADOW_CACHE_TTL_MAX);
+					else if (recent_hit_rate < 10 &&
+						 blocked_pct <
+						 ZRAM_SHADOW_PREFETCH_BLOCKED_TTL_SHRINK_PCT)
+						zram->wb->shadow_ttl_jiffies = max_t(unsigned long,
+							zram->wb->shadow_ttl_jiffies -
+							ZRAM_SHADOW_CACHE_TTL_SHRINK_STEP,
+							ZRAM_SHADOW_CACHE_TTL_MIN);
+					zram->wb->shadow_cache_limit =
+						zram_shadow_cache_limit_for_clusters(
+							target_clusters);
 					zram->wb->idle_skip_interval = 30;
 				}
 				if (io_psi >= IO_PSI_STOP_WRITEBACK_THRESHOLD &&
@@ -4828,30 +5300,40 @@ static unsigned long zram_shrinker_scan(struct shrinker *shrinker, struct shrink
          * 如果找到了足够的聚合页面 (>= MIN_AGGREGATE)，则全部提交。
          * 否则，只提交种子本身，放弃邻居（邻居可能是未来的种子）。
          */
-        if (nr_claimed >= MIN_AGGREGATE) {
-            /* Case A: 聚合成功 */
-            last_window_end = seed + WINDOW_RADIUS;
+		if (nr_claimed >= MIN_AGGREGATE) {
+			/* Case A: 聚合成功 */
+			last_window_end = seed + WINDOW_RADIUS;
 
-            for (k = 0; k < nr_claimed; k++) {
-                /* place_pp_slot 可能涉及内存分配，现在是安全的 */
-                if (place_pp_slot(zram, work->ctl, window_claimed[k])) {
-                    pages_scheduled++;
-                } else {
-                    rollback_slot(zram, window_claimed[k]);
-                }
-            }
-        } else {
-            /* Case B: 聚合失败，仅回收 Seed */
-            for (k = 0; k < nr_claimed; k++) {
-                unsigned long idx = window_claimed[k];
-                
-                if (idx == seed) {
-                    if (place_pp_slot(zram, work->ctl, idx)) {
-                        pages_scheduled++;
-                    } else {
-                        rollback_slot(zram, idx);
-                    }
-                } else {
+			for (k = 0; k < nr_claimed; k++) {
+				/* place_pp_slot 可能涉及内存分配，现在是安全的 */
+				unsigned long idx = window_claimed[k];
+
+				zram_slot_lock(zram, idx);
+				if (zram_test_flag(zram, idx, ZRAM_PP_SLOT) &&
+				    place_pp_slot(zram, work->ctl, idx)) {
+					zram_slot_unlock(zram, idx);
+					pages_scheduled++;
+				} else {
+					zram_slot_unlock(zram, idx);
+					rollback_slot(zram, idx);
+				}
+			}
+		} else {
+			/* Case B: 聚合失败，仅回收 Seed */
+			for (k = 0; k < nr_claimed; k++) {
+				unsigned long idx = window_claimed[k];
+
+				if (idx == seed) {
+					zram_slot_lock(zram, idx);
+					if (zram_test_flag(zram, idx, ZRAM_PP_SLOT) &&
+					    place_pp_slot(zram, work->ctl, idx)) {
+						zram_slot_unlock(zram, idx);
+						pages_scheduled++;
+					} else {
+						zram_slot_unlock(zram, idx);
+						rollback_slot(zram, idx);
+					}
+				} else {
                     /* 回滚邻居，保留它们 flags 干净，以便后续循环它们作为 Seed 时能被选中 */
                     rollback_slot(zram, idx);
                 }

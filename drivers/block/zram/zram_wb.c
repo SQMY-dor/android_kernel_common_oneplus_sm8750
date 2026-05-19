@@ -9,6 +9,7 @@
 #include <linux/wait.h>
 #include <linux/freezer.h>
 #include <linux/blkdev.h>
+#include <linux/ktime.h>
 #include <linux/wait_bit.h>
 #include <linux/sysms_finder.h>
 
@@ -18,6 +19,28 @@ static struct task_struct *wb_thread;
 static DECLARE_WAIT_QUEUE_HEAD(wb_wq);
 static struct zram_wb_request_list wb_req_list;
 static struct bio_set zram_wb_bs;
+
+#define ZRAM_WB_SLOW_GC_THRESHOLD_MS 200
+#define ZRAM_WB_GC_BUDGET_MS 20
+#define ZRAM_WB_SLOWPATH_COOLDOWN (5 * HZ)
+
+static bool zram_wb_slowpath_active(struct zram *zram)
+{
+	return time_before(jiffies, READ_ONCE(zram->wb->slowpath_until));
+}
+
+void zram_wb_record_slow_read(struct zram *zram, unsigned long entry,
+			      u64 latency_ns)
+{
+	u64 latency_ms = div_u64(latency_ns, NSEC_PER_MSEC);
+	u64 old_max = READ_ONCE(zram->wb->slow_read_lat_max_ns);
+
+	WRITE_ONCE(zram->wb->slow_read_lat_max_ns, max(latency_ns, old_max));
+	WRITE_ONCE(zram->wb->slowpath_until, jiffies + ZRAM_WB_SLOWPATH_COOLDOWN);
+
+	pr_warn_ratelimited("slow readback: entry=%lu latency=%llums, throttle writeback/gc\n",
+			    entry, latency_ms);
+}
 
 static bool zram_wb_allowed(struct zram *zram);
 
@@ -64,6 +87,9 @@ static void zram_gc_periodic_workfn(struct work_struct *work)
 static bool zram_wb_allowed(struct zram *zram)
 {
 	if (READ_ONCE(zram->wb->stop_writeback))
+		return false;
+
+	if (zram_wb_slowpath_active(zram))
 		return false;
 
 	if (check_screen_off_state())
@@ -267,9 +293,11 @@ static unsigned int zram_wb_cluster_score(struct zram *zram,
 	unsigned int transitions = 0;
 	unsigned int current_run = 0;
 	unsigned int memcg_bonus = 0;
+	unsigned int locality_bonus = 0;
 	bool prev_set = false;
 	bool seen_prev = false;
 	unsigned long blk;
+	unsigned long cluster_idx;
 
 	for (blk = cluster_base; blk < cluster_end; blk++) {
 		bool set = test_bit(blk, zram->wb->bitmap);
@@ -314,13 +342,32 @@ static unsigned int zram_wb_cluster_score(struct zram *zram,
 		}
 	}
 
+	cluster_idx = cluster_base >> ZRAM_WB_CLUSTER_SHIFT;
+	if (cluster_idx < zram->wb->shadow_prefetch_nr_clusters &&
+	    zram->wb->shadow_prefetch_confidence &&
+	    zram->wb->shadow_prefetch_direction &&
+	    zram->wb->shadow_prefetch_stride) {
+		u8 confidence = zram->wb->shadow_prefetch_confidence[cluster_idx];
+		s8 direction = zram->wb->shadow_prefetch_direction[cluster_idx];
+		s8 stride = zram->wb->shadow_prefetch_stride[cluster_idx];
+
+		if (confidence)
+			locality_bonus += confidence * 3;
+		if (direction)
+			locality_bonus += 2;
+		if (abs((int)stride) == 1)
+			locality_bonus += 4;
+		else if (abs((int)stride) == 2)
+			locality_bonus += 2;
+	}
+
 	frag->cluster_base = cluster_base;
 	frag->used = used;
 	frag->holes = holes;
 	frag->max_run = max_run;
 	frag->transitions = transitions;
 	frag->score = (used - max_run) * 4 + holes * 2 + transitions +
-			  memcg_bonus * 2 + min_t(unsigned long,
+			  memcg_bonus * 2 + locality_bonus + min_t(unsigned long,
 				  zram->wb->shadow_last_hit_rate / 10, 10UL);
 
 	return frag->score;
@@ -371,6 +418,7 @@ int zram_gc_compact(struct zram *zram, int target_pages)
 	struct page *pages[ZRAM_WB_MAX_BATCH_SIZE];
 	struct zram_wb_memcg_group *groups;
 	struct zram_wb_frag_score best;
+	ktime_t gc_start;
 	u16 preferred_memcg;
 	unsigned long new_base;
 	int act_count = 0;
@@ -382,6 +430,10 @@ int zram_gc_compact(struct zram *zram, int target_pages)
 	if (!zram_wb_allowed(zram) || target_pages <= 1 ||
 	    target_pages > ZRAM_WB_MAX_BATCH_SIZE)
 		return 0;
+
+	gc_start = ktime_get();
+	if (target_pages > 4)
+		target_pages = 4;
 
 	for (i = 0; i < target_pages; i++)
 		pages[i] = NULL;
@@ -426,8 +478,11 @@ int zram_gc_compact(struct zram *zram, int target_pages)
 		if (!picked_memcg)
 			break;
 
+		if (ktime_ms_delta(ktime_get(), gc_start) >= ZRAM_WB_GC_BUDGET_MS)
+			goto rollback;
+
 		nr_selected = zram_wb_collect_memcg(zram, picked_memcg,
-						   indexes, old_blks,
+					   indexes, old_blks,
 						   nr_selected, target_pages);
 		for (g = 0; g < nr_groups; g++) {
 			if (groups[g].memcg_id == picked_memcg)
@@ -446,6 +501,9 @@ int zram_gc_compact(struct zram *zram, int target_pages)
 	}
 
 	for (i = 0; i < nr_selected; i++) {
+		if (ktime_ms_delta(ktime_get(), gc_start) >= ZRAM_WB_GC_BUDGET_MS)
+			goto free_new_range;
+
 		pages[i] = alloc_page(GFP_NOIO | __GFP_NOWARN);
 		if (!pages[i])
 			goto free_new_range;
@@ -455,6 +513,9 @@ int zram_gc_compact(struct zram *zram, int target_pages)
 	}
 
 	for (i = 0; i < nr_selected; i++) {
+		if (ktime_ms_delta(ktime_get(), gc_start) >= ZRAM_WB_GC_BUDGET_MS)
+			goto free_new_range;
+
 		if (zram_wb_write_page(zram, pages[i], new_base + i))
 			goto free_new_range;
 	}
@@ -492,6 +553,17 @@ int zram_gc_compact(struct zram *zram, int target_pages)
 
 	if (force_reclaim && zram_wb_allowed(zram))
 		zram_wb_find_best_cluster(zram, &best);
+
+	if (ktime_ms_delta(ktime_get(), gc_start) >= ZRAM_WB_SLOW_GC_THRESHOLD_MS) {
+		u64 gc_ns = ktime_to_ns(ktime_sub(ktime_get(), gc_start));
+		u64 gc_ms = div_u64(gc_ns, NSEC_PER_MSEC);
+		u64 old_max = READ_ONCE(zram->wb->slow_gc_lat_max_ns);
+
+		WRITE_ONCE(zram->wb->slow_gc_lat_max_ns, max(gc_ns, old_max));
+		WRITE_ONCE(zram->wb->slowpath_until, jiffies + ZRAM_WB_SLOWPATH_COOLDOWN);
+		pr_warn_ratelimited("slow gc compact: pages=%d latency=%llums, throttle writeback/gc\n",
+				    nr_selected, gc_ms);
+	}
 
 	kfree(groups);
 

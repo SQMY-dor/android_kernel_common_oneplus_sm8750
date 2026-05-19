@@ -96,23 +96,22 @@ struct zram_table_entry {
 #define BATCH_SIZE 64
 #define WINDOW_RADIUS 8
 #define MIN_AGGREGATE 4
-#define ZRAM_SHADOW_CACHE_TTL	(2 * HZ)
+#define ZRAM_SHADOW_CACHE_TTL	(4 * HZ)
 #define ZRAM_SHADOW_CACHE_TTL_MIN	(HZ / 2)
 #define ZRAM_SHADOW_CACHE_TTL_MAX	(10 * HZ)
 #define ZRAM_SHADOW_CACHE_TTL_GROW_STEP	(HZ / 2)
-#define ZRAM_SHADOW_CACHE_TTL_SHRINK_STEP	(HZ)
+#define ZRAM_SHADOW_CACHE_TTL_SHRINK_STEP	(HZ / 2)
+#define ZRAM_SHADOW_CACHE_DEFAULT_CLUSTERS	24
+#define ZRAM_SHADOW_CACHE_BOOST_CLUSTERS	24
+#define ZRAM_SHADOW_CACHE_EMERGENCY_CLUSTERS	2
 #define ZRAM_SHADOW_HIT_WINDOW	64
 #define ZRAM_SHADOW_PREFETCH_TRIGGER_WINDOW	4
+#define ZRAM_SHADOW_PREFETCH_WINDOW_PAGES	4
 #define ZRAM_SHADOW_PREFETCH_PENDING_TTL	HZ
 #define ZRAM_SHADOW_PREFETCH_MAX_ACTIVE	1
 #define ZRAM_GC_PERIODIC_INTERVAL	(15 * HZ)
 #define ZRAM_GC_PERIODIC_PAGES	16
 #define ZRAM_GC_MAX_SCAN_CLUSTERS	128
-
-enum zram_shadow_cache_state {
-	ZRAM_SHADOW_CLEAN = 0,
-	ZRAM_SHADOW_HIT,
-};
 
 enum zram_wb_cluster_state {
 	ZRAM_WB_CLUSTER_CLEAN = 0,
@@ -128,10 +127,14 @@ struct zram_shadow_cache {
 	unsigned long cluster_base;
 	unsigned long expires_at;
 	unsigned long ttl_jiffies;
-	unsigned long state_bitmap;
+	u32 start_off;
 	u32 nr_pages;
+	u32 max_pages;
 	u32 age_seq;
 	u32 bytes;
+	u32 hit_count;
+	u8 confidence;
+	s8 direction;
 };
 
 struct zram_shadow_prefetch {
@@ -140,7 +143,9 @@ struct zram_shadow_prefetch {
 	struct zram *zram;
 	unsigned long cluster_base;
 	u32 cluster_off;
+	u32 start_off;
 	u32 nr_pages;
+	s8 direction;
 };
 #endif
 
@@ -169,6 +174,15 @@ struct zram_stats {
 	atomic64_t reject_reclaim_fail;
 	atomic64_t prefetch_total;
 	atomic64_t prefetch_hits;
+	atomic64_t prefetch_accesses;
+	atomic64_t prefetched_pages;
+	atomic64_t prefetch_evicted;
+	atomic64_t prefetch_expired;
+	atomic64_t prefetch_blocked;
+	atomic64_t prefetch_cooldown;
+	atomic64_t prefetch_zero_hits;
+	atomic64_t prefetch_single_hits;
+	atomic64_t prefetch_multi_hits;
 #endif
 };
 
@@ -185,9 +199,18 @@ struct zram_wb_state {
 	unsigned long shadow_last_hit_rate;
 	unsigned long gc_scan_cursor;
 	unsigned long idle_skip_interval;
+	unsigned long prefetch_cooldown_until;
+	unsigned long slowpath_until;
 	u64 bd_wb_limit;
 	u64 last_monitored_bd_reads;
 	u64 last_monitored_bd_writes;
+	u64 last_monitored_prefetch_total;
+	u64 last_monitored_prefetch_hits;
+	u64 last_monitored_prefetch_accesses;
+	u64 last_monitored_prefetch_expired;
+	u64 last_monitored_prefetch_blocked;
+	u64 slow_read_lat_max_ns;
+	u64 slow_gc_lat_max_ns;
 	struct shrinker *zram_shrinker;
 	struct list_lru zram_list_lru;
 	struct work_struct shrink_work;
@@ -206,6 +229,10 @@ struct zram_wb_state {
 	unsigned long *shadow_prefetch_inflight;
 	unsigned long *shadow_prefetch_first_ts;
 	u8 *shadow_prefetch_first_off;
+	u8 *shadow_prefetch_last_off;
+	s8 *shadow_prefetch_stride;
+	u8 *shadow_prefetch_confidence;
+	s8 *shadow_prefetch_direction;
 	unsigned long shadow_prefetch_nr_clusters;
 	u32 gc_target_pages;
 	u32 shadow_cache_bytes;
@@ -216,6 +243,7 @@ struct zram_wb_state {
 	bool wb_limit_enable;
 	bool stop_writeback;
 	bool prefetch_disabled;
+	bool prefetch_hwm_blocked;
 	bool emergency_reclaim;
 };
 #endif
