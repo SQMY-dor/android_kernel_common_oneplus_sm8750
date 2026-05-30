@@ -834,9 +834,6 @@ static void loop_queue_work(struct loop_device *lo, struct loop_cmd *cmd)
 	bool skip = false;
 
 	spin_lock_irq(&lo->lo_work_lock);
-	trace_android_vh_loop_skip_queue_work(blk_mq_rq_from_pdu(cmd), &skip);
-        if (skip)
-                goto skip_queue_work;
 
 	if (queue_on_root_worker(cmd->blkcg_css))
 		goto queue_work;

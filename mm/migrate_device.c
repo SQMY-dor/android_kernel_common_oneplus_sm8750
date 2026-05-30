@@ -843,8 +843,8 @@ void migrate_device_finalize(unsigned long *src_pfns,
 			dst = src;
 		}
 
-		if (!folio_is_zone_device(dst))
-			folio_add_lru(dst);
+		src = page_folio(page);
+		dst = page_folio(newpage);
 		remove_migration_ptes(src, dst, false);
 		folio_unlock(src);
 		folio_put(src);

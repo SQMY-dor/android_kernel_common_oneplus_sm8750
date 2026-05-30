@@ -1474,11 +1474,7 @@ static int unmap_and_move_huge_page(new_folio_t get_new_folio,
 
 	if (page_was_mapped)
 		remove_migration_ptes(src,
-			rc == MIGRATEPAGE_SUCCESS ? dst : src,
-				ttu ? true : false);
-
-	if (ttu & TTU_RMAP_LOCKED)
-		i_mmap_unlock_write(mapping);
+			rc == MIGRATEPAGE_SUCCESS ? dst : src, false);
 
 unlock_put_anon:
 	folio_unlock(dst);
