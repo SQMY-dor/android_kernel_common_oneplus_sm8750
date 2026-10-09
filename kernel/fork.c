@@ -1022,6 +1022,7 @@ void __put_task_struct(struct task_struct *tsk)
 #ifdef CONFIG_HMBIRD_SCHED
 	hmbird_free(tsk);
 #endif
+	trace_android_vh_put_task(tsk);
 	put_dmabuf_info(tsk->dmabuf_info);
 	io_uring_free(tsk);
 	cgroup_free(tsk);
