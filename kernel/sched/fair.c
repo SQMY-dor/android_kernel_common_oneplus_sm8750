@@ -5166,6 +5166,13 @@ static inline int task_fits_cpu(struct task_struct *p, int cpu)
 	unsigned long uclamp_min = uclamp_eff_value(p, UCLAMP_MIN);
 	unsigned long uclamp_max = uclamp_eff_value(p, UCLAMP_MAX);
 	unsigned long util = task_util_est(p);
+	bool fits = true, done = false;
+
+	trace_android_rvh_task_fits_cpu(p, util, uclamp_min, uclamp_max, cpu, &fits, &done);
+
+	if (done)
+		return fits;
+
 	/*
 	 * Return true only if the cpu fully fits the task requirements, which
 	 * include the utilization but also the performance hints.
@@ -8713,12 +8720,6 @@ idle:
 		if (new_tasks > 0)
 			goto again;
 	}
-
-	/*
-	 * rq is about to be idle, check if we need to update the
-	 * lost_idle_time of clock_pelt
-	 */
-	update_idle_rq_clock_pelt(rq);
 
 	return NULL;
 }
